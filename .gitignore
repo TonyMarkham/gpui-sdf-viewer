@@ -1,0 +1,15 @@
+# Build Artifacts
+/target/
+
+# IDE
+.idea/
+
+# LLM
+.claude/
+.codex/
+
+# Soul
+.soul/
+
+# Semantic Graph
+.refactor-radar/

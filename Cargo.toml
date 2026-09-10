@@ -1,0 +1,45 @@
+[workspace]
+members = [
+    "crates/sdf-app",
+    "crates/sdf-component",
+    "crates/sdf-ui",
+    "crates/soul-attr",
+]
+resolver              = "3"
+
+[workspace.package]
+version               = "0.1.0"
+edition               = "2024"
+
+[workspace.dependencies]
+error-location        = { version = "0.1.0" }
+gpui                  = { git = "https://github.com/zed-industries/zed", version = "=0.2.2" }
+gpui_platform         = { git = "https://github.com/zed-industries/zed", version = "=0.1.0" }
+gpui-component        = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0", version = "0.5.2" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0", version = "0.5.1" }
+image                 = { version = "0.25.1", default-features = false }
+pollster              = { version = "0.4.0" }
+serde_json            = { version = "1.0.151" }
+smallvec              = { version = "1.15.2" }
+thiserror             = { version = "2.0.20" }
+wgpu                  = { version = "29.0.4", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "vulkan",
+    "metal",
+    "gles",
+    "wgsl",
+] }
+
+sdf-app               = { path = "crates/sdf-app" }
+sdf-component         = { path = "crates/sdf-component" }
+sdf-ui                = { path = "crates/sdf-ui" }
+soul-attr             = { path = "crates/soul-attr" }
+
+[workspace.lints.clippy]
+unwrap_used            = "deny"
+expect_used            = "deny"
+panic                  = "deny"
+
+[workspace.lints.rust]
+unused_must_use        = "deny"

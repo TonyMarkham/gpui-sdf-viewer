@@ -1,0 +1,520 @@
+use crate::{
+    error::{Error, Result},
+    scene::SdfScene,
+};
+use gpui::RenderImage;
+use image::{Frame, RgbaImage};
+use smallvec::SmallVec;
+use soul_attr::soul;
+use std::{
+    io::Write as _,
+    sync::{Arc, mpsc},
+};
+
+use wgpu::{
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages,
+    ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState,
+    LoadOp, MapMode, MultisampleState, Operations, PipelineLayoutDescriptor, PowerPreference,
+    PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, Texture, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
+};
+
+/// Size of the uniform block in bytes. Must match the WGSL `Uniforms` struct:
+/// `resolution: vec2f` (0..8), `time: f32` (8..12), `aspect: f32` (12..16),
+/// `mouse: vec2f` (16..24), pad (24..32), `params: vec4f` (32..48).
+const UNIFORM_SIZE: u64 = 48;
+
+/// Number of staging buffers kept in flight; the ring lets the GPU run a
+/// little ahead of presentation.
+const STAGING_SLOTS: usize = 3;
+
+/// Per-frame inputs for the renderer, in canvas UV space where applicable.
+pub(crate) struct FrameRequest {
+    pub width: u32,
+    pub height: u32,
+    pub time: f32,
+    pub mouse: [f32; 2],
+}
+
+/// A wgpu render-to-texture pipeline for SDF scenes with a ring of staging
+/// buffers for non-blocking CPU readback.
+pub(crate) struct Renderer {
+    device: Device,
+    queue: Queue,
+    uniform_buffer: Buffer,
+    bind_group: BindGroup,
+    pipeline_layout: wgpu::PipelineLayout,
+    compiled_source: Option<String>,
+    pipeline: Option<RenderPipeline>,
+    target: Option<Target>,
+    staging: Vec<Staging>,
+    adapter_summary: String,
+}
+
+struct Target {
+    texture: Texture,
+    width: u32,
+    height: u32,
+}
+
+struct Staging {
+    buffer: Buffer,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    state: StagingState,
+    mapped: Option<mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>>,
+}
+
+enum StagingState {
+    /// Unmapped and ready to receive the next frame copy.
+    Free,
+    /// Copy submitted, waiting for the map callback.
+    InFlight,
+    /// Map callback fired; bytes are parked until presented.
+    Mapped(Vec<u8>),
+}
+
+impl Renderer {
+    /// Creates the wgpu instance/adapter/device. Blocking; call once.
+    #[soul(id = "interaction.sdf.render-frame", step = "device bring-up")]
+    pub fn new() -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .map_err(|_| Error::no_adapter())?;
+
+        let adapter_info = adapter.get_info();
+        let adapter_summary = format!("{} ({:?})", adapter_info.name, adapter_info.backend);
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("sdf-component"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .map_err(Error::device)?;
+
+        device.on_uncaptured_error(Arc::new(|error| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "sdf-component: uncaptured wgpu error: {error}"
+            );
+        }));
+
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("sdf-bind-group-layout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
+                },
+                count: None,
+            }],
+        });
+
+        let uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("sdf-uniforms"),
+            size: UNIFORM_SIZE,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("sdf-bind-group"),
+            layout: &bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("sdf-pipeline-layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            uniform_buffer,
+            bind_group,
+            pipeline_layout,
+            compiled_source: None,
+            pipeline: None,
+            target: None,
+            staging: Vec::new(),
+            adapter_summary,
+        })
+    }
+
+    /// One-line summary of the adapter this renderer runs on, for status UIs.
+    pub fn adapter_summary(&self) -> &str {
+        &self.adapter_summary
+    }
+
+    /// Submits (or continues) the render for `request` and returns a finished
+    /// CPU frame when one became available. Readback is asynchronous: the
+    /// first call for a new scene or size usually returns `Ok(None)` while the
+    /// GPU works; the caller keeps calling (the canvas drives this with
+    /// animation frames) until a frame arrives.
+    #[soul(id = "interaction.sdf.render-frame", step = "submit + readback")]
+    pub fn render(
+        &mut self,
+        scene: &SdfScene,
+        request: &FrameRequest,
+    ) -> Result<Option<Arc<RenderImage>>> {
+        if self.compiled_source.as_deref() != Some(scene.source()) {
+            let pipeline = self.compile_scene(scene)?;
+            self.pipeline = Some(pipeline);
+            self.compiled_source = Some(scene.source().to_string());
+        }
+
+        self.ensure_target(request.width, request.height)?;
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, &uniform_bytes(request));
+        self.submit_frame(request.width, request.height);
+        self.advance_slots()?;
+
+        self.build_presentable_frame(request.width, request.height)
+    }
+
+    /// Compiles the scene's WGSL, capturing validation errors through an error
+    /// scope instead of panicking.
+    fn compile_scene(&mut self, scene: &SdfScene) -> Result<RenderPipeline> {
+        let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("sdf-scene"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(scene.module_source())),
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(error) = pollster::block_on(guard.pop()) {
+            return Err(Error::scene_compile(&error.to_string()));
+        }
+
+        Ok(self
+            .device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("sdf-pipeline"),
+                layout: Some(&self.pipeline_layout),
+                vertex: VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            }))
+    }
+
+    fn ensure_target(&mut self, width: u32, height: u32) -> Result<()> {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.width == width && target.height == height)
+        {
+            return Ok(());
+        }
+
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("sdf-target"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        self.target = Some(Target {
+            texture,
+            width,
+            height,
+        });
+
+        // Retire every staging buffer that cannot serve the new size.
+        let mut still_needed = Vec::new();
+        for slot in self.staging.drain(..) {
+            let current_size = slot.width == width && slot.height == height;
+            if current_size || matches!(slot.state, StagingState::InFlight) {
+                still_needed.push(slot);
+            } else if let StagingState::Mapped(_) = slot.state {
+                slot.buffer.unmap();
+            }
+            // Free slots for other sizes simply drop (unmapped buffers).
+        }
+        self.staging = still_needed;
+        while self.slots_for(width, height) < STAGING_SLOTS {
+            self.staging.push(self.create_staging_slot(width, height)?);
+        }
+
+        Ok(())
+    }
+
+    fn create_staging_slot(&self, width: u32, height: u32) -> Result<Staging> {
+        let bytes_per_row = row_pitch(width * 4);
+        let buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("sdf-staging"),
+            size: u64::from(bytes_per_row) * u64::from(height),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(Staging {
+            buffer,
+            width,
+            height,
+            bytes_per_row,
+            state: StagingState::Free,
+            mapped: None,
+        })
+    }
+
+    /// Submits render + copy into one free staging slot of the current size.
+    #[soul(id = "interaction.sdf.render-frame", step = "render pass + copy")]
+    fn submit_frame(&mut self, width: u32, height: u32) {
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return;
+        };
+        let Some(slot_index) = self.free_slot_index(width, height) else {
+            return;
+        };
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("sdf-encoder"),
+            });
+        {
+            let view = target
+                .texture
+                .create_view(&TextureViewDescriptor::default());
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("sdf-render-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let slot = &mut self.staging[slot_index];
+        encoder.copy_texture_to_buffer(
+            target.texture.as_image_copy(),
+            TexelCopyBufferInfo {
+                buffer: &slot.buffer,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(slot.bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let _ = self.queue.submit([encoder.finish()]);
+
+        let (sender, receiver) = mpsc::channel();
+        slot.buffer.map_async(MapMode::Read, .., move |result| {
+            let _ = sender.send(result);
+        });
+        slot.state = StagingState::InFlight;
+        slot.mapped = Some(receiver);
+    }
+
+    /// Polls the device and promotes completed mappings to `Mapped` (dropping
+    /// data for sizes that no longer match the target).
+    #[soul(id = "interaction.sdf.render-frame", step = "drain maps")]
+    fn advance_slots(&mut self) -> Result<()> {
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| Error::readback(&format!("{error}")))?;
+
+        let Some(target) = self.target.as_ref() else {
+            return Ok(());
+        };
+
+        for slot in &mut self.staging {
+            if !matches!(slot.state, StagingState::InFlight) {
+                continue;
+            }
+            let Some(receiver) = slot.mapped.as_mut() else {
+                continue;
+            };
+            match receiver.try_recv() {
+                Err(_) => {}
+                Ok(Err(error)) => {
+                    slot.mapped = None;
+                    slot.state = StagingState::Free;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "sdf-component: staging map failed: {error}"
+                    );
+                }
+                Ok(Ok(())) => {
+                    let current_size = slot.width == target.width && slot.height == target.height;
+                    let data = slot.read_mapped();
+                    slot.mapped = None;
+                    slot.state = if current_size {
+                        StagingState::Mapped(data)
+                    } else {
+                        StagingState::Free
+                    };
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Converts the oldest finished staging buffer of the current size into a
+    /// `RenderImage` with BGRA-ordered bytes, as gpui's atlas expects.
+    #[soul(id = "interaction.sdf.render-frame", step = "staging to BGRA")]
+    fn build_presentable_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Arc<RenderImage>>> {
+        let Some(slot_index) = self.staging.iter().position(|slot| {
+            slot.width == width
+                && slot.height == height
+                && matches!(slot.state, StagingState::Mapped(_))
+        }) else {
+            return Ok(None);
+        };
+
+        let slot = &mut self.staging[slot_index];
+        let StagingState::Mapped(data) = &slot.state else {
+            return Ok(None);
+        };
+        let bytes = bgra_bytes(data, width, height, slot.bytes_per_row)
+            .ok_or_else(|| Error::readback("staging data did not fill the frame"))?;
+        let frame_buffer = RgbaImage::from_raw(width, height, bytes)
+            .ok_or_else(|| Error::readback("frame buffer allocation failed"))?;
+
+        slot.state = StagingState::Free;
+
+        Ok(Some(Arc::new(RenderImage::new(SmallVec::from_elem(
+            Frame::new(frame_buffer),
+            1,
+        )))))
+    }
+
+    fn free_slot_index(&self, width: u32, height: u32) -> Option<usize> {
+        self.staging.iter().position(|slot| {
+            slot.width == width && slot.height == height && matches!(slot.state, StagingState::Free)
+        })
+    }
+
+    fn slots_for(&self, width: u32, height: u32) -> usize {
+        self.staging
+            .iter()
+            .filter(|slot| slot.width == width && slot.height == height)
+            .count()
+    }
+}
+
+fn row_pitch(bytes: u32) -> u32 {
+    bytes.div_ceil(256) * 256
+}
+
+/// Reorders readback bytes from the RGBA render target into BGRA order and
+/// strips row padding, producing tightly packed BGRA frames as expected by
+/// gpui's `RenderImage`.
+fn bgra_bytes(data: &[u8], width: u32, height: u32, bytes_per_row: u32) -> Option<Vec<u8>> {
+    let row = (width * 4) as usize;
+    let pitch = bytes_per_row as usize;
+    let mut out = vec![0u8; row * height as usize];
+    for y in 0..height as usize {
+        let src = data.get(y * pitch..y * pitch + row)?;
+        let dst = &mut out[y * row..(y + 1) * row];
+        for (d, s) in dst
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src.as_chunks::<4>().0)
+        {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            d[3] = s[3];
+        }
+    }
+    Some(out)
+}
+
+fn uniform_bytes(request: &FrameRequest) -> [u8; 48] {
+    let mut bytes = [0u8; 48];
+    let values = [
+        request.width as f32,
+        request.height as f32,
+        request.time,
+        request.width as f32 / request.height.max(1) as f32,
+        request.mouse[0],
+        request.mouse[1],
+    ];
+    for (index, value) in values.iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+impl Staging {
+    /// Copies the mapped buffer contents and unmaps. Only valid after the map
+    /// callback reported success.
+    fn read_mapped(&self) -> Vec<u8> {
+        let view = self.buffer.get_mapped_range(..);
+        let data = view.to_vec();
+        drop(view);
+        self.buffer.unmap();
+        data
+    }
+}

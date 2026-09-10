@@ -1,0 +1,17 @@
+[package]
+name                  = "sdf-component"
+version               = { workspace = true }
+edition               = { workspace = true }
+
+[dependencies]
+error-location        = { workspace = true }
+gpui                  = { workspace = true }
+image                 = { workspace = true }
+pollster              = { workspace = true }
+smallvec              = { workspace = true }
+soul-attr             = { workspace = true }
+thiserror             = { workspace = true }
+wgpu                  = { workspace = true }
+
+[lints]
+workspace             = true

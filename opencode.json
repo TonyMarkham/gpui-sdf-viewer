@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openrouter/z-ai/glm-5.3-flash",
+  "mcp": {
+    "soul": {
+      "type": "local",
+      "command": [
+        ".soul\\indexer.exe",
+        "serve",
+        "--root",
+        "."
+      ],
+      "enabled": true
+    },
+    "refactor-radar": {
+      "type": "local",
+      "command": [
+        ".refactor-radar\\bin\\semantic-graph-mcp-server.exe",
+        "--database-path",
+        ".refactor-radar\\content.db",
+        "--fts-database-path",
+        ".refactor-radar\\fts.db"
+      ],
+      "enabled": true
+    }
+  }
+}

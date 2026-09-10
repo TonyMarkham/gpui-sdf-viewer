@@ -1,0 +1,14 @@
+[package]
+name                  = "sdf-app"
+version               = { workspace = true }
+edition               = { workspace = true }
+
+[dependencies]
+error-location        = { workspace = true }
+gpui                  = { workspace = true }
+gpui_platform         = { workspace = true }
+sdf-ui                = { workspace = true }
+thiserror             = { workspace = true }
+
+[lints]
+workspace             = true
