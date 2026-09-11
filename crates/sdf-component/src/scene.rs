@@ -1,4 +1,7 @@
-use crate::error::{Error, Result};
+use crate::{
+    data::SceneData,
+    error::{Error, Result},
+};
 use soul_attr::soul;
 use std::path::Path;
 
@@ -15,10 +18,24 @@ use std::path::Path;
 /// ```text
 /// // sdf-scene: name = "Metaballs"
 /// // sdf-scene: animated = true
+/// // sdf-scene: data = "manifest.json"
+/// // sdf-scene: layer = "coast"
 /// ```
 ///
 /// `name` controls the label shown in the UI; `animated` selects whether the
 /// scene is re-rendered every frame with a running `time` value.
+///
+/// `data` and `layer` turn the scene into a data scene: `data` names a VS-20
+/// export manifest, resolved relative to the scene file, and `layer` selects
+/// one self-contained entry from the manifest's `layers` array by `name`
+/// (a hard error when absent). The manifest is resolved and structurally
+/// validated at load, and the entry's tile payloads are verified against
+/// their declared sha256 and uploaded into the field texture when it is
+/// first built, at first render; see [`SdfScene::from_file`] and
+/// [`SdfCanvasState`](crate::SdfCanvasState). Scenes created through
+/// [`SdfScene::from_str`] cannot resolve a manifest (there is no file to
+/// resolve against), so the renderer rejects them; data scenes are loaded
+/// from disk through [`SdfScene::from_file`].
 ///
 /// The scene body must define:
 ///
@@ -37,14 +54,25 @@ use std::path::Path;
 /// alpha; the returned color is premultiplied by the component before
 /// presentation.
 ///
-/// The prelude reserves the names `u`, `sd_*`, `op_*` and `rot` for its
-/// helpers; scenes must not define them.
+/// The prelude reserves the names `u`, `sd_*`, `op_*`, `rot`, `field`,
+/// `field_lod`, `field_raw`, `field_coord`, `field_uv`, `FieldCoord`,
+/// `t_field`, `s_field`, `s_field_nearest`, and `FIELD_*` for its helpers;
+/// scenes must not define them.
 #[derive(Clone, Debug)]
 pub struct SdfScene {
     name: String,
     animated: bool,
     render_override: bool,
+    data_request: Option<DataRequest>,
+    data: Option<SceneData>,
     source: String,
+}
+
+/// The unresolved `data` + `layer` directives of a scene header.
+#[derive(Clone, Debug)]
+struct DataRequest {
+    manifest: String,
+    layer: String,
 }
 
 impl SdfScene {
@@ -54,6 +82,8 @@ impl SdfScene {
     pub fn from_str(source: &str, fallback_name: &str) -> Result<Self> {
         let mut name: Option<String> = None;
         let mut animated = false;
+        let mut manifest: Option<String> = None;
+        let mut layer: Option<String> = None;
         let mut body = String::new();
 
         for line in source.lines() {
@@ -68,6 +98,8 @@ impl SdfScene {
                     match key {
                         "name" => name = Some(String::from(value)),
                         "animated" => animated = value.eq_ignore_ascii_case("true"),
+                        "data" => manifest = Some(String::from(value)),
+                        "layer" => layer = Some(String::from(value)),
                         _ => {}
                     }
                 }
@@ -77,6 +109,16 @@ impl SdfScene {
                 }
             }
         }
+
+        let data_request = match (manifest, layer) {
+            (Some(manifest), Some(layer)) => Some(DataRequest { manifest, layer }),
+            (None, None) => None,
+            _ => {
+                return Err(Error::scene_invalid(
+                    "the `data` and `layer` directives are a pair; a scene must carry both or neither",
+                ));
+            }
+        };
 
         let render_override = body.contains(RENDER_ENTRY);
         if !body.contains(SCENE_ENTRY) && !render_override {
@@ -89,18 +131,34 @@ impl SdfScene {
             name: name.unwrap_or_else(|| String::from(fallback_name)),
             animated,
             render_override,
+            data_request,
+            data: None,
             source: body,
         })
     }
 
-    /// Reads and parses a scene from a file on disk.
+    /// Reads and parses a scene from a file on disk. A data scene's manifest
+    /// resolves relative to the scene file's directory and is loaded here, so
+    /// manifest failures surface through the scene-load error path; payload
+    /// verification and upload happen later, when the field texture is first
+    /// built at render time.
     pub fn from_file(path: &Path) -> Result<Self> {
         let source = std::fs::read_to_string(path).map_err(Error::scene_file)?;
         let fallback_name = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .map_or_else(|| String::from("scene"), String::from);
-        Self::from_str(&source, &fallback_name)
+        let mut scene = Self::from_str(&source, &fallback_name)?;
+
+        if let Some(request) = &scene.data_request {
+            let manifest_path = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&request.manifest);
+            scene.data = Some(SceneData::load(&manifest_path, &request.layer)?);
+        }
+
+        Ok(scene)
     }
 
     /// The scenes compiled into the component: guaranteed-valid examples that
@@ -139,16 +197,46 @@ impl SdfScene {
         self.animated
     }
 
-    /// Returns the full WGSL shader module for this scene: prelude, user body,
-    /// and the rasterizer entry points (with either the built-in 2D shading or
-    /// the scene's `render` override).
+    /// The scene's resolved data, if it is a data scene.
+    pub(crate) fn data(&self) -> Option<&SceneData> {
+        self.data.as_ref()
+    }
+
+    /// Whether the header carries the `data` + `layer` directives. Scenes
+    /// parsed through [`SdfScene::from_str`] keep the directives unresolved;
+    /// only [`SdfScene::from_file`] can resolve them, so a requested-but-
+    /// unresolved scene must not render with the inert no-data binding.
+    pub(crate) fn data_requested(&self) -> bool {
+        self.data_request.is_some()
+    }
+
+    /// Identity of the scene's data binding: the manifest and layer the field
+    /// texture was built from, or `None` for the inert no-data binding.
+    pub(crate) fn data_key(&self) -> Option<String> {
+        self.data
+            .as_ref()
+            .map(|data| format!("{}#{}", data.manifest.display(), data.layer))
+    }
+
+    /// The full WGSL shader module for this scene: prelude (with the field
+    /// geometry constants the data declares, or the inert 1×1 shape), user
+    /// body, and the rasterizer entry points (with either the built-in 2D
+    /// shading or the scene's `render` override).
     pub(crate) fn module_source(&self) -> String {
         let main = if self.render_override {
             MAIN_RENDER_OVERRIDE
         } else {
             MAIN_DEFAULT
         };
-        format!("{PRELUDE}\n{}\n{main}", self.source)
+        let (grid, levels) = self
+            .data
+            .as_ref()
+            .map_or((1, 1), |data| (data.grid, data.level_count()));
+        format!(
+            "{UNIFORM_BINDINGS}\n{}\n{SDF_HELPERS}\n{}\n{main}",
+            field_helpers(grid, levels),
+            self.source
+        )
     }
 }
 
@@ -156,8 +244,11 @@ const HEADER_DIRECTIVE: &str = "// sdf-scene:";
 const SCENE_ENTRY: &str = "fn scene(";
 const RENDER_ENTRY: &str = "fn render(";
 
-const PRELUDE: &str = r#"// sdf-component prelude — reserved names: u, sd_*, op_*, rot.
-struct Uniforms {
+/// The uniform block and every field binding. One bind group shape serves
+/// both scene classes: data scenes bind the field texture array, scenes
+/// without data bind a 1×1 zero-filled stand-in so the field helpers stay
+/// inert.
+pub(crate) const UNIFORM_BINDINGS: &str = r#"struct Uniforms {
     resolution: vec2f,
     time: f32,
     aspect: f32,
@@ -166,8 +257,69 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var t_field: texture_2d_array<f32>;
+@group(0) @binding(2) var s_field: sampler;
+@group(0) @binding(3) var s_field_nearest: sampler;
+"#;
 
-fn sd_circle(p: vec2f, r: f32) -> f32 {
+/// The field sampling helpers, specialized for one layer geometry: `grid` is
+/// the tile-grid edge (1 for the inert no-data binding) and `levels` the mip
+/// chain length.
+///
+/// `field_uv` maps canvas coordinates onto the field; `FIELD_V_FLIP` selects
+/// the vertical orientation. Calibrated against the map pipeline's crops:
+/// the map repo's crop writer slices its rows from field row 0 upward
+/// (crop top-left = field coords (6016, 3072) for Hernand bay), and this
+/// prelude with `FIELD_V_FLIP = 1.0` puts field row 0 at the canvas top —
+/// both images orient field rows top-down, so the GUI presents the crops
+/// unmirrored. Mirrored output would flip this one constant, here and
+/// nowhere else.
+pub(crate) fn field_helpers(grid: u32, levels: u32) -> String {
+    let header =
+        format!("const FIELD_TILES: u32 = {grid}u;\nconst FIELD_LEVELS: u32 = {levels}u;\n");
+    let mut source = header;
+    source.push_str(FIELD_HELPERS);
+    source
+}
+
+const FIELD_HELPERS: &str = r#"const FIELD_V_FLIP: f32 = 1.0;
+
+struct FieldCoord {
+    uv: vec2f,
+    layer: u32,
+};
+
+fn field_uv(p: vec2f) -> vec2f {
+    let x = (p.x / u.aspect + 1.0) * 0.5;
+    let up = (p.y + 1.0) * 0.5;
+    let y = mix(up, 1.0 - up, FIELD_V_FLIP);
+    return clamp(vec2f(x, y), vec2f(0.0), vec2f(1.0 - 1e-6));
+}
+
+fn field_coord(p: vec2f) -> FieldCoord {
+    let grid_uv = field_uv(p) * f32(FIELD_TILES);
+    let tile = floor(grid_uv);
+    return FieldCoord(grid_uv - tile, u32(tile.y * f32(FIELD_TILES) + tile.x));
+}
+
+fn field_lod(p: vec2f, level: f32) -> f32 {
+    let lod = clamp(level, 0.0, f32(FIELD_LEVELS - 1u));
+    let coord = field_coord(p);
+    return textureSampleLevel(t_field, s_field, coord.uv, coord.layer, lod).r;
+}
+
+fn field_raw(p: vec2f, level: f32) -> f32 {
+    let lod = clamp(level, 0.0, f32(FIELD_LEVELS - 1u));
+    let coord = field_coord(p);
+    return textureSampleLevel(t_field, s_field_nearest, coord.uv, coord.layer, lod).r;
+}
+
+fn field(p: vec2f) -> f32 {
+    return field_lod(p, u.params.x);
+}
+"#;
+
+const SDF_HELPERS: &str = r#"fn sd_circle(p: vec2f, r: f32) -> f32 {
     return length(p) - r;
 }
 

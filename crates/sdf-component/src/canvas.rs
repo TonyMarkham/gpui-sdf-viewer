@@ -17,6 +17,12 @@ const FPS_EMA_FACTOR: f32 = 0.9;
 /// absurd textures.
 const MAX_TEXTURE_EDGE: u32 = 4096;
 
+/// Default mip-level selector (`params.x`): sample the field at level 0.
+const FIELD_LEVEL_DEFAULT: f32 = 0.0;
+
+/// Default contour-overlay band width (`params.y`): the pass is off.
+const CONTOUR_BAND_DEFAULT: f32 = 0.0;
+
 /// A reusable SDF rendering surface for gpui.
 ///
 /// Drop it into any view as `sdf_canvas(state.clone())` where `state` is an
@@ -52,6 +58,8 @@ pub struct SdfCanvasState {
     frame: Option<Arc<RenderImage>>,
     size: (u32, u32),
     mouse_uv: [f32; 2],
+    field_level: f32,
+    contour_band: f32,
     animated: bool,
     start: Instant,
     last_present: Option<Instant>,
@@ -68,6 +76,8 @@ impl SdfCanvasState {
             frame: None,
             size: (0, 0),
             mouse_uv: [0.0, 0.0],
+            field_level: FIELD_LEVEL_DEFAULT,
+            contour_band: CONTOUR_BAND_DEFAULT,
             animated: false,
             start: Instant::now(),
             last_present: None,
@@ -75,12 +85,13 @@ impl SdfCanvasState {
         }
     }
 
-    /// Selects the scene to render. Cheap when the scene is unchanged.
+    /// Selects the scene to render. Cheap when the scene is unchanged —
+    /// including its data binding, so two scenes sharing a body but not a
+    /// manifest entry still switch.
     pub fn set_scene(&mut self, scene: SdfScene, cx: &mut Context<Self>) {
-        let unchanged = self
-            .scene
-            .as_ref()
-            .is_some_and(|current| current.source() == scene.source());
+        let unchanged = self.scene.as_ref().is_some_and(|current| {
+            current.source() == scene.source() && current.data_key() == scene.data_key()
+        });
         if unchanged {
             return;
         }
@@ -100,7 +111,8 @@ impl SdfCanvasState {
         self.renderer.as_ref().map(Renderer::adapter_summary)
     }
 
-    /// The active failure, if any: renderer bring-up or scene compilation.
+    /// The active failure, if any: renderer bring-up, scene compilation, or
+    /// data loading.
     pub fn error(&self) -> Option<&str> {
         self.compile_error
             .as_deref()
@@ -116,6 +128,54 @@ impl SdfCanvasState {
     /// up.
     pub fn fps(&self) -> Option<f32> {
         (self.fps > 0.0).then_some(self.fps)
+    }
+
+    /// Whether the active scene binds game data (and so gets the contour
+    /// overlay and a meaningful mip-level selector).
+    pub fn has_data(&self) -> bool {
+        self.scene
+            .as_ref()
+            .is_some_and(|scene| scene.data().is_some())
+    }
+
+    /// Number of mip levels the active scene's data declares, for UI ranges.
+    pub fn field_level_count(&self) -> Option<u32> {
+        self.scene
+            .as_ref()
+            .and_then(|scene| scene.data())
+            .map(|data| data.level_count())
+    }
+
+    /// The active mip-level selector: a 0..1 position across the field's
+    /// chain.
+    pub fn field_level(&self) -> f32 {
+        self.field_level
+    }
+
+    /// Selects the mip level the field helpers sample, as a 0..1 position
+    /// across the active data's chain; a no-op without an active scene.
+    pub fn set_field_level(&mut self, level: f32, cx: &mut Context<Self>) {
+        let level = level.clamp(0.0, 1.0);
+        if (self.field_level - level).abs() <= f32::EPSILON {
+            return;
+        }
+        self.field_level = level;
+        cx.notify();
+    }
+
+    /// The active contour-overlay band width (`params.y`); 0.0 means off.
+    pub fn contour_band(&self) -> f32 {
+        self.contour_band
+    }
+
+    /// Sets the contour-overlay band width (`params.y`); 0.0 skips the pass.
+    pub fn set_contour_band(&mut self, band: f32, cx: &mut Context<Self>) {
+        let band = band.max(0.0);
+        if (self.contour_band - band).abs() <= f32::EPSILON {
+            return;
+        }
+        self.contour_band = band;
+        cx.notify();
     }
 }
 
@@ -221,7 +281,7 @@ impl SdfCanvas {
                 }
             }
 
-            let (Some(scene), Some(renderer)) = (state.scene.clone(), state.renderer.as_mut())
+            let (Some(scene), Some(renderer)) = (state.scene.as_ref(), state.renderer.as_mut())
             else {
                 return;
             };
@@ -233,14 +293,22 @@ impl SdfCanvas {
             } else {
                 0.0
             };
+            let level = state
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.data())
+                .map_or(0.0, |data| {
+                    (state.field_level * (data.level_count().max(1) - 1) as f32).round()
+                });
 
             match renderer.render(
-                &scene,
+                scene,
                 &FrameRequest {
                     width,
                     height,
                     time,
                     mouse: state.mouse_uv,
+                    params: [level, state.contour_band],
                 },
             ) {
                 Ok(maybe_image) => {

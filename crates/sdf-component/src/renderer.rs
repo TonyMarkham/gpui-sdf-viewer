@@ -1,9 +1,12 @@
 use crate::{
+    data::SceneData,
     error::{Error, Result},
+    overlay,
     scene::SdfScene,
 };
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use soul_attr::soul;
 use std::{
@@ -12,19 +15,22 @@ use std::{
 };
 
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages,
     ColorTargetState, ColorWrites, CommandEncoderDescriptor, Device, Extent3d, FragmentState,
-    LoadOp, MapMode, MultisampleState, Operations, PipelineLayoutDescriptor, PowerPreference,
-    PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, Texture, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
+    LoadOp, MapMode, MapRangeError, MultisampleState, Operations, Origin3d,
+    PipelineLayoutDescriptor, PowerPreference, PrimitiveState, Queue, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, Sampler,
+    SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp,
+    TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
 /// Size of the uniform block in bytes. Must match the WGSL `Uniforms` struct:
 /// `resolution: vec2f` (0..8), `time: f32` (8..12), `aspect: f32` (12..16),
-/// `mouse: vec2f` (16..24), pad (24..32), `params: vec4f` (32..48).
+/// `mouse: vec2f` (16..24), pad (24..32), `params: vec4f` (32..48): `.x` is
+/// the mip-level selector, `.y` the contour-overlay band width.
 const UNIFORM_SIZE: u64 = 48;
 
 /// Number of staging buffers kept in flight; the ring lets the GPU run a
@@ -37,6 +43,9 @@ pub(crate) struct FrameRequest {
     pub height: u32,
     pub time: f32,
     pub mouse: [f32; 2],
+    /// `params.x` — the field mip-level selector; `params.y` — the contour
+    /// overlay band width in field bytes (0.0 = overlay off).
+    pub params: [f32; 2],
 }
 
 /// A wgpu render-to-texture pipeline for SDF scenes with a ring of staging
@@ -45,7 +54,22 @@ pub(crate) struct Renderer {
     device: Device,
     queue: Queue,
     uniform_buffer: Buffer,
+    bind_group_layout: BindGroupLayout,
+    linear_sampler: Sampler,
+    nearest_sampler: Sampler,
+    stub_view: TextureView,
     bind_group: BindGroup,
+    field: Option<Texture>,
+    field_key: Option<String>,
+    /// The data key whose last upload attempt failed, with the error to keep
+    /// raising. A failed upload is deterministic — a payload stays missing,
+    /// corrupt, or truncated until the scene's data changes — so re-attempting
+    /// it on every paint would re-read and re-hash the layer's payloads each
+    /// frame. Cleared when a different data identity is rendered, so a
+    /// corrected payload is picked up on the next scene switch.
+    field_failure: Option<(String, String)>,
+    overlay_pipeline: Option<RenderPipeline>,
+    overlay_source: Option<String>,
     pipeline_layout: wgpu::PipelineLayout,
     compiled_source: Option<String>,
     pipeline: Option<RenderPipeline>,
@@ -88,6 +112,7 @@ impl Renderer {
             power_preference: PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .map_err(|_| Error::no_adapter())?;
 
@@ -113,16 +138,40 @@ impl Renderer {
 
         let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("sdf-bind-group-layout"),
-            entries: &[BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
         });
 
         let uniform_buffer = device.create_buffer(&BufferDescriptor {
@@ -132,13 +181,69 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let linear_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("sdf-field-linear"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let nearest_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("sdf-field-nearest"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        // The inert no-data binding: a 1×1 zero-filled stand-in so one bind
+        // group shape serves both scene classes. Buffer memory backing
+        // textures is zero-initialized, so the stub reads 0.0 everywhere
+        // without an upload.
+        let stub_texture = device.create_texture(&TextureDescriptor {
+            label: Some("sdf-field-stub"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let stub_view = stub_texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("sdf-bind-group"),
             layout: &bind_group_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&stub_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&linear_sampler),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&nearest_sampler),
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -151,7 +256,16 @@ impl Renderer {
             device,
             queue,
             uniform_buffer,
+            bind_group_layout,
+            linear_sampler,
+            nearest_sampler,
+            stub_view,
             bind_group,
+            field: None,
+            field_key: None,
+            field_failure: None,
+            overlay_pipeline: None,
+            overlay_source: None,
             pipeline_layout,
             compiled_source: None,
             pipeline: None,
@@ -177,28 +291,359 @@ impl Renderer {
         scene: &SdfScene,
         request: &FrameRequest,
     ) -> Result<Option<Arc<RenderImage>>> {
-        if self.compiled_source.as_deref() != Some(scene.source()) {
-            let pipeline = self.compile_scene(scene)?;
+        if scene.data_requested() && scene.data().is_none() {
+            return Err(Error::data(
+                "the scene carries `data`/`layer` directives but was not loaded from a file, \
+                 so its manifest could not be resolved",
+            ));
+        }
+
+        self.ensure_field(scene)?;
+        self.ensure_overlay(scene)?;
+
+        let module_source = scene.module_source();
+        if self.compiled_source.as_deref() != Some(module_source.as_str()) {
+            let pipeline = self.compile_pipeline("sdf-scene", &module_source, "fs_main", None)?;
             self.pipeline = Some(pipeline);
-            self.compiled_source = Some(scene.source().to_string());
+            self.compiled_source = Some(module_source);
         }
 
         self.ensure_target(request.width, request.height)?;
         self.queue
             .write_buffer(&self.uniform_buffer, 0, &uniform_bytes(request));
-        self.submit_frame(request.width, request.height);
+        self.submit_frame(request.width, request.height, request);
         self.advance_slots()?;
 
         self.build_presentable_frame(request.width, request.height)
     }
 
-    /// Compiles the scene's WGSL, capturing validation errors through an error
-    /// scope instead of panicking.
-    fn compile_scene(&mut self, scene: &SdfScene) -> Result<RenderPipeline> {
+    /// Aligns the bound field texture with the scene's data: uploads the
+    /// layer's tiles when the data identity changed, or rebinds the inert
+    /// 1×1 stub when the scene carries none. A failed upload is recorded and
+    /// re-raised on subsequent paints without re-reading the payloads.
+    #[soul(id = "concept.sdf-scene-contract", step = "field texture + upload")]
+    fn ensure_field(&mut self, scene: &SdfScene) -> Result<()> {
+        let key = scene.data_key();
+        if let Some((failed_key, message)) = &self.field_failure
+            && Some(failed_key) == key.as_ref()
+        {
+            return Err(Error::data(message));
+        }
+        // Reaching here with a recorded failure means the data identity
+        // changed: the old record is stale and the next attempt is fresh.
+        self.field_failure = None;
+        if key == self.field_key {
+            return Ok(());
+        }
+
+        match scene.data() {
+            Some(data) => {
+                let texture = match self.create_field_texture(data) {
+                    Ok(texture) => texture,
+                    Err(error) => {
+                        let message = match &error {
+                            Error::Data { message, .. } => String::from(message),
+                            other => other.to_string(),
+                        };
+                        if let Some(key) = key {
+                            self.field_failure = Some((key, message.clone()));
+                        }
+                        return Err(Error::data(&message));
+                    }
+                };
+                let view = texture.create_view(&TextureViewDescriptor {
+                    dimension: Some(TextureViewDimension::D2Array),
+                    ..Default::default()
+                });
+                self.bind_field(&view);
+                self.field = Some(texture);
+            }
+            None => {
+                let view = self.stub_view.clone();
+                self.bind_field(&view);
+                self.field = None;
+            }
+        }
+        self.field_key = key;
+
+        Ok(())
+    }
+
+    /// Rebuilds the bind group around `view`; the samplers and uniform
+    /// binding are carried over unchanged.
+    fn bind_field(&mut self, view: &TextureView) {
+        self.bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("sdf-bind-group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                },
+            ],
+        });
+    }
+
+    /// Creates the field texture array for `data` and uploads every tile:
+    /// read the payload, verify its sha256 against the manifest, check its
+    /// length against the declared mip sizes, then write one texture level
+    /// per mip. Stub tiles carry a constant-fill payload and expand to their
+    /// grid region at every level. Anything above a device limit is rejected
+    /// with the limit named, never truncated.
+    fn create_field_texture(&self, data: &SceneData) -> Result<Texture> {
+        let limits = self.device.limits();
+        let tile_edge = data.levels[0].size;
+        if tile_edge > limits.max_texture_dimension_2d {
+            return Err(Error::data(&format!(
+                "layer `{}`: tile edge {tile_edge} exceeds the device limit max_texture_dimension_2d = {}",
+                data.layer, limits.max_texture_dimension_2d
+            )));
+        }
+        let layers = u64::from(data.grid) * u64::from(data.grid);
+        if layers > u64::from(limits.max_texture_array_layers) {
+            return Err(Error::data(&format!(
+                "layer `{}`: the {}×{} tile grid needs {layers} texture array layers, exceeding the device limit max_texture_array_layers = {}",
+                data.layer, data.grid, data.grid, limits.max_texture_array_layers
+            )));
+        }
+        let layers = layers as u32;
+        let level_count = data.level_count();
+        let max_levels = tile_edge.ilog2() + 1;
+        if level_count > max_levels {
+            return Err(Error::data(&format!(
+                "layer `{}`: the manifest declares {level_count} mip levels for a {tile_edge}² tile, which supports at most {max_levels}",
+                data.layer
+            )));
+        }
+
+        let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("sdf-field"),
+            size: Extent3d {
+                width: tile_edge,
+                height: tile_edge,
+                depth_or_array_layers: layers,
+            },
+            mip_level_count: level_count,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(error) = pollster::block_on(guard.pop()) {
+            return Err(Error::data(&format!(
+                "layer `{}`: field texture creation failed: {error}",
+                data.layer
+            )));
+        }
+
+        for tile in &data.tiles {
+            let payload = std::fs::read(&tile.payload).map_err(|error| {
+                Error::data(&format!(
+                    "layer `{}`: tile `{}` at ({}, {}): payload could not be read: {error}",
+                    data.layer,
+                    tile.payload.display(),
+                    tile.x,
+                    tile.y
+                ))
+            })?;
+
+            let actual = sha256_hex(&payload);
+            if !actual.eq_ignore_ascii_case(&tile.sha256) {
+                return Err(Error::data(&format!(
+                    "layer `{}`: tile `{}` at ({}, {}): payload sha256 {actual} does not match the manifest's {}",
+                    data.layer,
+                    tile.payload.display(),
+                    tile.x,
+                    tile.y,
+                    tile.sha256
+                )));
+            }
+
+            if tile.stub {
+                let Some(constant) = payload.first() else {
+                    return Err(Error::data(&format!(
+                        "layer `{}`: tile `{}` at ({}, {}): stub payload is empty",
+                        data.layer,
+                        tile.payload.display(),
+                        tile.x,
+                        tile.y
+                    )));
+                };
+                if payload.iter().any(|byte| byte != constant) {
+                    return Err(Error::data(&format!(
+                        "layer `{}`: tile `{}` at ({}, {}): stub payload is not constant-fill",
+                        data.layer,
+                        tile.payload.display(),
+                        tile.x,
+                        tile.y
+                    )));
+                }
+                for (index, level) in data.levels.iter().enumerate() {
+                    let filled = vec![*constant; level.bytes as usize];
+                    self.write_level(
+                        &texture,
+                        tile.y * data.grid + tile.x,
+                        index as u32,
+                        level.size,
+                        &filled,
+                    )?;
+                }
+            } else {
+                let expected = data.tile_payload_len();
+                if payload.len() as u64 != expected {
+                    return Err(Error::data(&format!(
+                        "layer `{}`: tile `{}` at ({}, {}): payload is {} bytes, the manifest's mip table declares {expected}",
+                        data.layer,
+                        tile.payload.display(),
+                        tile.x,
+                        tile.y,
+                        payload.len()
+                    )));
+                }
+                let mut offset = 0usize;
+                for (index, level) in data.levels.iter().enumerate() {
+                    let end = offset + level.bytes as usize;
+                    let Some(level_bytes) = payload.get(offset..end) else {
+                        return Err(Error::data(&format!(
+                            "layer `{}`: tile `{}` at ({}, {}): payload ends before mip level {index}",
+                            data.layer,
+                            tile.payload.display(),
+                            tile.x,
+                            tile.y
+                        )));
+                    };
+                    self.write_level(
+                        &texture,
+                        tile.y * data.grid + tile.x,
+                        index as u32,
+                        level.size,
+                        level_bytes,
+                    )?;
+                    offset = end;
+                }
+            }
+        }
+
+        Ok(texture)
+    }
+
+    /// Writes one mip level of one tile into the field texture array, padding
+    /// rows to the copy pitch when the level is narrower than 256 bytes.
+    fn write_level(
+        &self,
+        texture: &Texture,
+        layer: u32,
+        level: u32,
+        size: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let pitch = row_pitch(size);
+        let mut padded;
+        let source: &[u8] = if pitch == size {
+            bytes
+        } else {
+            padded = vec![0u8; pitch as usize * size as usize];
+            for row in 0..size as usize {
+                let src = row * size as usize;
+                padded[row * pitch as usize..row * pitch as usize + size as usize]
+                    .copy_from_slice(&bytes[src..src + size as usize]);
+            }
+            &padded
+        };
+
+        self.queue.write_texture(
+            TexelCopyTextureInfo {
+                texture,
+                mip_level: level,
+                origin: Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: TextureAspect::All,
+            },
+            source,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch),
+                rows_per_image: Some(size),
+            },
+            Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Compiles the contour overlay pipeline when a data texture is bound;
+    /// recompiles when the field geometry changed. The overlay pass itself
+    /// only runs while `params.y` enables it.
+    fn ensure_overlay(&mut self, scene: &SdfScene) -> Result<()> {
+        if !self.field_key.is_some() {
+            self.overlay_pipeline = None;
+            self.overlay_source = None;
+            return Ok(());
+        }
+
+        let (grid, levels) = scene
+            .data()
+            .map_or((1, 1), |data| (data.grid, data.level_count()));
+        let source = overlay::module_source(grid, levels);
+        if self.overlay_source.as_deref() == Some(source.as_str()) {
+            return Ok(());
+        }
+        self.overlay_pipeline = Some(self.compile_pipeline(
+            "sdf-overlay",
+            &source,
+            "fs_overlay",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            }),
+        )?);
+        self.overlay_source = Some(source);
+        Ok(())
+    }
+
+    /// Compiles one WGSL module into a render pipeline over the shared bind
+    /// group layout, capturing validation errors through an error scope
+    /// instead of panicking.
+    fn compile_pipeline(
+        &self,
+        label: &str,
+        source: &str,
+        fragment_entry: &str,
+        blend: Option<wgpu::BlendState>,
+    ) -> Result<RenderPipeline> {
         let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("sdf-scene"),
-            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(scene.module_source())),
+            label: Some(label),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(String::from(source))),
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         if let Some(error) = pollster::block_on(guard.pop()) {
@@ -208,7 +653,7 @@ impl Renderer {
         Ok(self
             .device
             .create_render_pipeline(&RenderPipelineDescriptor {
-                label: Some("sdf-pipeline"),
+                label: Some(label),
                 layout: Some(&self.pipeline_layout),
                 vertex: VertexState {
                     module: &module,
@@ -218,11 +663,11 @@ impl Renderer {
                 },
                 fragment: Some(FragmentState {
                     module: &module,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment_entry),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(ColorTargetState {
                         format: TextureFormat::Rgba8Unorm,
-                        blend: None,
+                        blend,
                         write_mask: ColorWrites::ALL,
                     })],
                 }),
@@ -300,9 +745,12 @@ impl Renderer {
         })
     }
 
-    /// Submits render + copy into one free staging slot of the current size.
+    /// Submits the scene render — plus the contour overlay pass when a data
+    /// texture is bound and the band width is on — and copies the result into
+    /// one free staging slot of the current size. The overlay runs after the
+    /// scene pass and before the copy, so captured frames carry it.
     #[soul(id = "interaction.sdf.render-frame", step = "render pass + copy")]
-    fn submit_frame(&mut self, width: u32, height: u32) {
+    fn submit_frame(&mut self, width: u32, height: u32, request: &FrameRequest) {
         let Some(target) = self.target.as_ref() else {
             return;
         };
@@ -312,6 +760,10 @@ impl Renderer {
         let Some(slot_index) = self.free_slot_index(width, height) else {
             return;
         };
+        let overlay_pipeline = self
+            .overlay_pipeline
+            .as_ref()
+            .filter(|_| self.field_key.is_some() && request.params[1] > 0.0);
 
         let mut encoder = self
             .device
@@ -322,25 +774,49 @@ impl Renderer {
             let view = target
                 .texture
                 .create_view(&TextureViewDescriptor::default());
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("sdf-render-pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            {
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("sdf-render-pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            if let Some(overlay_pipeline) = overlay_pipeline {
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("sdf-overlay-pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: Operations {
+                            load: LoadOp::Load,
+                            store: StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(overlay_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
 
         let slot = &mut self.staging[slot_index];
@@ -401,7 +877,18 @@ impl Renderer {
                 }
                 Ok(Ok(())) => {
                     let current_size = slot.width == target.width && slot.height == target.height;
-                    let data = slot.read_mapped();
+                    let data = match slot.read_mapped() {
+                        Ok(data) => data,
+                        Err(error) => {
+                            slot.mapped = None;
+                            slot.state = StagingState::Free;
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "sdf-component: staging read failed: {error}"
+                            );
+                            continue;
+                        }
+                    };
                     slot.mapped = None;
                     slot.state = if current_size {
                         StagingState::Mapped(data)
@@ -504,17 +991,37 @@ fn uniform_bytes(request: &FrameRequest) -> [u8; 48] {
     for (index, value) in values.iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
+    bytes[32..36].copy_from_slice(&request.params[0].to_le_bytes());
+    bytes[36..40].copy_from_slice(&request.params[1].to_le_bytes());
     bytes
+}
+
+/// Lowercase hex encoding of the sha256 digest of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 impl Staging {
     /// Copies the mapped buffer contents and unmaps. Only valid after the map
     /// callback reported success.
-    fn read_mapped(&self) -> Vec<u8> {
-        let view = self.buffer.get_mapped_range(..);
-        let data = view.to_vec();
-        drop(view);
+    fn read_mapped(&self) -> std::result::Result<Vec<u8>, MapRangeError> {
+        let data = match self.buffer.get_mapped_range(..) {
+            Ok(view) => {
+                let data = view.to_vec();
+                drop(view);
+                data
+            }
+            Err(error) => {
+                self.buffer.unmap();
+                return Err(error);
+            }
+        };
         self.buffer.unmap();
-        data
+        Ok(data)
     }
 }

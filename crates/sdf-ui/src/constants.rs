@@ -30,3 +30,15 @@ pub(crate) const CANVAS_ERROR_MAX_WIDTH: Pixels = px(640.0);
 pub(crate) const STATUS_SEPARATOR: &str = "  ·  ";
 pub(crate) const STATUS_NO_ADAPTER: &str = "wgpu renderer unavailable";
 pub(crate) const STATUS_NO_SCENE: &str = "No scene selected";
+
+pub(crate) const CONTROL_BAR_SELECTOR: &str = "control-bar";
+pub(crate) const CONTROL_BAR_HEIGHT: Pixels = px(36.0);
+pub(crate) const CONTROL_BAR_PADDING: Pixels = px(10.0);
+pub(crate) const CONTROL_BAR_TEXT_SIZE: Pixels = px(11.0);
+pub(crate) const CONTROL_BAR_SLIDER_WIDTH: Pixels = px(160.0);
+pub(crate) const CONTROL_BAR_GAP: Pixels = px(12.0);
+
+pub(crate) const CONTROL_LEVEL_LABEL: &str = "LOD";
+pub(crate) const CONTROL_CONTOUR_LABEL: &str = "Contours";
+pub(crate) const CONTOUR_BAND_DEFAULT: f32 = 8.0;
+pub(crate) const CONTOUR_BAND_MAX: f32 = 32.0;

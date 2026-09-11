@@ -1,6 +1,8 @@
 use crate::{
     AppState,
-    component::{navigation::Navigation, status_bar::StatusBar, title_bar::TitleBar},
+    component::{
+        control_bar::ControlBar, navigation::Navigation, status_bar::StatusBar, title_bar::TitleBar,
+    },
     constants::APPLICATION_TITLE,
     view::canvas::CanvasHost,
 };
@@ -32,6 +34,10 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let app = self.app_state.read(cx);
+        let level_slider = app.level_slider().clone();
+        let density_slider = app.density_slider().clone();
+
         div()
             .size_full()
             .flex()
@@ -53,6 +59,11 @@ impl Render for Root {
                             .min_h_0()
                             .flex_col()
                             .child(CanvasHost::new(self.app_state.clone()))
+                            .child(ControlBar::new(
+                                self.app_state.clone(),
+                                level_slider,
+                                density_slider,
+                            ))
                             .child(StatusBar::new(self.app_state.clone())),
                     ),
             )

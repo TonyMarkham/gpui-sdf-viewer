@@ -6,7 +6,9 @@
 //! images. See [`SdfCanvas`] and [`SdfCanvasState`].
 
 mod canvas;
+mod data;
 mod error;
+mod overlay;
 mod renderer;
 mod scene;
 

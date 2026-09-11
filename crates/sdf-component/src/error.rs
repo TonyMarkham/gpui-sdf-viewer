@@ -33,6 +33,12 @@ pub enum Error {
         location: ErrorLocation,
     },
 
+    #[error("The scene data could not be loaded: {message} {location}")]
+    Data {
+        message: String,
+        location: ErrorLocation,
+    },
+
     #[error("Failed to read back the rendered frame: {message} {location}")]
     Readback {
         message: String,
@@ -76,6 +82,16 @@ impl Error {
     #[track_caller]
     pub(crate) fn scene_compile(message: &str) -> Self {
         Self::SceneCompile {
+            message: String::from(message),
+            location: ErrorLocation::from(Location::caller()),
+        }
+    }
+
+    /// Builds the error used when a scene's data (manifest or tile payloads)
+    /// fails to load or verify.
+    #[track_caller]
+    pub fn data(message: &str) -> Self {
+        Self::Data {
             message: String::from(message),
             location: ErrorLocation::from(Location::caller()),
         }
