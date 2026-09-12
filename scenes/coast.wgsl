@@ -1,5 +1,5 @@
 // sdf-scene: name = "Coast"
-// sdf-scene: data = "D:/git/cd-data-extract/.work/fields/manifest.json"
+// sdf-scene: data = "config:sdf/manifest.json"
 // sdf-scene: layer = "coast"
 //
 // Game-data scene: the coast recipe from the map pipeline's config.toml

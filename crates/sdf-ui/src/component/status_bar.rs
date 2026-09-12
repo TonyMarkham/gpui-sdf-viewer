@@ -2,8 +2,11 @@ use crate::{
     AppState,
     constants::{
         STATUS_BAR_HEIGHT, STATUS_BAR_PADDING, STATUS_BAR_SELECTOR, STATUS_BAR_TEXT_SIZE,
-        STATUS_NO_ADAPTER, STATUS_NO_SCENE, STATUS_SEPARATOR,
+        STATUS_EXTRACTING, STATUS_EXTRACTION_FAILED, STATUS_GAME_DATA_MISSING,
+        STATUS_GAME_FOLDER_BAD, STATUS_GAME_FOLDER_INVALID, STATUS_GAME_FOLDER_OK,
+        STATUS_NO_ADAPTER, STATUS_NO_GAME_FOLDER, STATUS_NO_SCENE, STATUS_SEPARATOR,
     },
+    state::offline::OfflineStatus,
 };
 
 use gpui::{
@@ -12,8 +15,9 @@ use gpui::{
 };
 use gpui_component::ActiveTheme;
 
-/// Bottom strip summarizing the renderer: adapter, frame size, scene name,
-/// FPS, and any active failure.
+/// Bottom strip summarizing the offline state (game folder validity,
+/// extraction progress/failures) and the renderer: adapter, frame size,
+/// scene name, FPS, and any active failure.
 #[derive(IntoElement)]
 pub(crate) struct StatusBar {
     app_state: Entity<AppState>,
@@ -32,7 +36,11 @@ impl ParentElement for StatusBar {
 impl RenderOnce for StatusBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let canvas = self.app_state.read(cx).canvas().read(cx);
+        let app = self.app_state.read(cx);
+        let offline = app.offline().read(cx);
+        let canvas = app.canvas().read(cx);
+
+        let mut segments = offline_segments(&offline.status());
 
         let adapter = canvas
             .adapter_info()
@@ -52,24 +60,27 @@ impl RenderOnce for StatusBar {
             .map_or_else(|| String::from(STATUS_NO_SCENE), ToString::to_string);
         let error = canvas.error().map_or_else(
             || {
-                self.app_state
-                    .read(cx)
-                    .load_error()
+                app.load_error()
                     .map_or_else(String::new, ToString::to_string)
             },
             ToString::to_string,
         );
 
-        let status = if error.is_empty() {
-            let fps_segment = if fps.is_empty() {
-                String::new()
-            } else {
-                format!("{STATUS_SEPARATOR}{fps}")
-            };
-            format!("{scene}{STATUS_SEPARATOR}{adapter}{STATUS_SEPARATOR}{size} px{fps_segment}")
+        segments.push(scene);
+        if error.is_empty() {
+            segments.push(adapter);
+            segments.push(format!("{size} px"));
+            if !fps.is_empty() {
+                segments.push(fps);
+            }
         } else {
-            format!("{scene}{STATUS_SEPARATOR}{error}")
-        };
+            segments.push(error);
+        }
+
+        let status = segments.join(STATUS_SEPARATOR);
+
+        #[cfg(test)]
+        crate::component::capture::set_status(&status);
 
         div()
             .id("status-bar")
@@ -87,3 +98,41 @@ impl RenderOnce for StatusBar {
             .child(status)
     }
 }
+
+/// The offline part of the status line: game-folder validity first (a
+/// rejection, a missing folder, an invalid folder, missing extracted data, or
+/// ok), then the extraction progress and failure. Takes the whole status
+/// snapshot — the render call site passes it as one value, so no argument can
+/// be transposed or dropped there — and stays a pure function so every branch
+/// is pinned by tests.
+fn offline_segments(status: &OfflineStatus) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+
+    if !status.game_root_valid {
+        if let Some(rejection) = &status.rejection {
+            segments.push(format!("{STATUS_GAME_FOLDER_BAD}{rejection}"));
+        } else if status.game_root.is_empty() {
+            segments.push(String::from(STATUS_NO_GAME_FOLDER));
+        } else {
+            segments.push(String::from(STATUS_GAME_FOLDER_INVALID));
+        }
+    } else if !status.data_present {
+        segments.push(String::from(STATUS_GAME_DATA_MISSING));
+    } else {
+        segments.push(String::from(STATUS_GAME_FOLDER_OK));
+    }
+
+    if status.extraction_running {
+        segments.push(format!("{STATUS_EXTRACTING}{}", status.progress_line));
+    }
+    if let Some(failure) = &status.extraction_failed {
+        segments.push(format!("{STATUS_EXTRACTION_FAILED}{failure}"));
+    }
+
+    segments
+}
+
+// ---------------------------------------------------------------------------------------------- //
+
+#[cfg(test)]
+mod tests;

@@ -4,9 +4,11 @@ version               = { workspace = true }
 edition               = { workspace = true }
 
 [dependencies]
+clap                  = { workspace = true }
 error-location        = { workspace = true }
 gpui                  = { workspace = true }
 gpui_platform         = { workspace = true }
+sdf-offline           = { workspace = true }
 sdf-ui                = { workspace = true }
 thiserror             = { workspace = true }
 

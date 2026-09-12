@@ -1,10 +1,10 @@
 use crate::{
     AppState,
     component::{
-        control_bar::ControlBar, navigation::Navigation, status_bar::StatusBar, title_bar::TitleBar,
+        control_bar::ControlBar, navigation::Navigation, setup_panel::SetupPanel,
+        status_bar::StatusBar, title_bar::TitleBar,
     },
     constants::APPLICATION_TITLE,
-    view::canvas::CanvasHost,
 };
 
 use gpui::{
@@ -34,9 +34,22 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let app = self.app_state.read(cx);
-        let level_slider = app.level_slider().clone();
-        let density_slider = app.density_slider().clone();
+        let app = self.app_state.clone();
+
+        if self.app_state.read(cx).needs_setup(cx) {
+            let app = self.app_state.clone();
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(cx.theme().background)
+                .child(TitleBar::new().child(APPLICATION_TITLE))
+                .child(SetupPanel::new(app.clone()))
+                .child(StatusBar::new(app));
+        }
+
+        let level_slider = self.app_state.read(cx).level_slider().clone();
+        let density_slider = self.app_state.read(cx).density_slider().clone();
 
         div()
             .size_full()
@@ -50,7 +63,7 @@ impl Render for Root {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(Navigation::new(self.app_state.clone()))
+                    .child(Navigation::new(app.clone()))
                     .child(
                         div()
                             .flex()
@@ -58,13 +71,9 @@ impl Render for Root {
                             .min_w_0()
                             .min_h_0()
                             .flex_col()
-                            .child(CanvasHost::new(self.app_state.clone()))
-                            .child(ControlBar::new(
-                                self.app_state.clone(),
-                                level_slider,
-                                density_slider,
-                            ))
-                            .child(StatusBar::new(self.app_state.clone())),
+                            .child(crate::view::canvas::CanvasHost::new(app.clone()))
+                            .child(ControlBar::new(app.clone(), level_slider, density_slider))
+                            .child(StatusBar::new(app)),
                     ),
             )
     }

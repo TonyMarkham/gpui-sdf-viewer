@@ -1,5 +1,5 @@
 // sdf-scene: name = "Road"
-// sdf-scene: data = "D:/git/cd-data-extract/.work/fields/manifest.json"
+// sdf-scene: data = "config:sdf/manifest.json"
 // sdf-scene: layer = "road"
 //
 // Game-data scene: the road band recipe from the map pipeline's config.toml

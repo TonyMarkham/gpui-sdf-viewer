@@ -1,5 +1,5 @@
 // sdf-scene: name = "Inspect"
-// sdf-scene: data = "D:/git/cd-data-extract/.work/fields/manifest.json"
+// sdf-scene: data = "config:sdf/manifest.json"
 // sdf-scene: layer = "coast"
 //
 // Debug scene: nearest-neighbor raw bytes at the mip level chosen by

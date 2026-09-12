@@ -1,5 +1,5 @@
 // sdf-scene: name = "Mountain"
-// sdf-scene: data = "D:/git/cd-data-extract/.work/fields/manifest.json"
+// sdf-scene: data = "config:sdf/manifest.json"
 // sdf-scene: layer = "mountain"
 //
 // Game-data scene: the two-level mountain hatch from the map pipeline's

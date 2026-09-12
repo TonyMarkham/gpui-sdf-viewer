@@ -1,5 +1,5 @@
 use crate::scene::{UNIFORM_BINDINGS, field_helpers};
-use soul_attr::soul;
+use soul_attributes::soul;
 
 /// The component theme's contour-overlay ink: presentation, so it lives here
 /// and not in any scene.

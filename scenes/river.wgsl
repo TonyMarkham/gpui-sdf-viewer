@@ -1,5 +1,5 @@
 // sdf-scene: name = "River"
-// sdf-scene: data = "D:/git/cd-data-extract/.work/fields/manifest.json"
+// sdf-scene: data = "config:sdf/manifest.json"
 // sdf-scene: layer = "river"
 //
 // Game-data scene: the river trench recipe from the map pipeline's

@@ -1,5 +1,5 @@
 // sdf-scene: name = "Abyss hex"
-// sdf-scene: data = "D:/git/cd-data-extract/.work/fields/manifest.json"
+// sdf-scene: data = "config:sdf/manifest.json"
 // sdf-scene: layer = "abyss_hex"
 //
 // Game-data scene: the abyss-hex band recipe from the map pipeline's

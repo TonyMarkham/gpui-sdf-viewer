@@ -2,8 +2,8 @@
 members = [
     "crates/sdf-app",
     "crates/sdf-component",
+    "crates/sdf-offline",
     "crates/sdf-ui",
-    "crates/soul-attr",
 ]
 resolver              = "3"
 
@@ -12,30 +12,31 @@ version               = "0.1.0"
 edition               = "2024"
 
 [workspace.dependencies]
+chacha20              = { version = "0.10.2", features = ["cipher"] }
+clap                  = { version = "4.6.6", features = ["derive"] }
+dirs                  = { version = "7.0.0" }
 error-location        = { version = "0.1.0" }
 gpui                  = { git = "https://github.com/zed-industries/zed", version = "=0.2.2" }
 gpui_platform         = { git = "https://github.com/zed-industries/zed", version = "=0.1.0" }
 gpui-component        = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0", version = "0.5.2" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0", version = "0.5.1" }
 image                 = { version = "0.25.10", default-features = false }
+lz4_flex              = { version = "0.14.0" }
 pollster              = { version = "1.0.1" }
-serde_json            = { version = "1.0.151" }
+serde                 = { version = "1.0.229", features = ["derive"] }
+serde_json            = { version = "1.0.151", features = ["preserve_order"] }
 sha2                  = { version = "0.11.0" }
 smallvec              = { version = "1.16.0" }
+soul-attributes       = { version = "0.1.1" }
 thiserror             = { version = "2.0.20" }
-wgpu                  = { version = "30.0.1", default-features = false, features = [
-    "std",
-    "parking_lot",
-    "vulkan",
-    "metal",
-    "gles",
-    "wgsl",
-] }
+toml                  = { version = "1.1.6" }
+toml_edit             = { version = "0.25.15" }
+wgpu                  = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "gles", "wgsl", ] }
 
 sdf-app               = { path = "crates/sdf-app" }
 sdf-component         = { path = "crates/sdf-component" }
+sdf-offline           = { path = "crates/sdf-offline" }
 sdf-ui                = { path = "crates/sdf-ui" }
-soul-attr             = { path = "crates/soul-attr" }
 
 [workspace.lints.clippy]
 unwrap_used            = "deny"

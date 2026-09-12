@@ -9,12 +9,15 @@ gpui                  = { workspace = true }
 gpui-component        = { workspace = true }
 gpui-component-assets = { workspace = true }
 sdf-component         = { workspace = true }
+sdf-offline           = { workspace = true }
 serde_json            = { workspace = true }
-soul-attr             = { workspace = true }
+soul-attributes       = { workspace = true }
 thiserror             = { workspace = true }
 
 [dev-dependencies]
 gpui                  = { workspace = true, features = ["test-support"] }
+serde_json            = { workspace = true }
+sha2                  = { workspace = true }
 
 [lints]
 workspace             = true

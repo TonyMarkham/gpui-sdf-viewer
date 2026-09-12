@@ -14,11 +14,13 @@ between a fixed prelude of SDF helpers and a fixed rasterizer kernel.
 ## Where
 
 - Files live anywhere; the app scans the `scenes/` directory at the working
-  root (override with the `SDF_SCENES_DIR` environment variable). File scenes
-  are listed before the component's embedded examples, alphabetically — the
-  first file scene is the app's startup selection.
-- The component ships guaranteed-valid embedded examples (see
-  `SdfScene::embedded_examples`).
+  root (override with the `SDF_SCENES_DIR` environment variable), sorted
+  alphabetically — the first file scene is the app's startup selection.
+- There are no embedded scenes. An empty scenes directory shows the empty
+  list; on a machine where setup is incomplete, the setup panel is the first
+  view instead. Discovery lists every `.wgsl` file it finds without parsing
+  it — a scene that fails to load stays in the list, and selecting it
+  surfaces the named load error in the status bar.
 
 ## File shape
 
@@ -34,9 +36,17 @@ Header directives (optional, one per line):
 - `name` — label shown in the navigation and status bar
 - `animated` — re-render every frame with a running `time` value
 - `data` + `layer` — a pair: `data` names a VS-20 export manifest,
-  resolved relative to the scene file; `layer` selects one self-contained
-  entry from the manifest's `layers` array by `name` (hard error when
-  absent). Carrying only one of the two is a parse error.
+  resolved relative to the scene file, or through the `config:` scheme
+  (below); `layer` selects one self-contained entry from the manifest's
+  `layers` array by `name` (hard error when absent). Carrying only one of
+  the two is a parse error.
+- A `data` value of the form `config:<remainder>` resolves through the app
+  config: `<data dir>/<remainder>` — the directory the extraction pipeline
+  writes to, by default `~/.config/cd-map-offline/data`, and configurable
+  via `paths.data_dir`. The host shell rewrites the directive to the
+  resolved absolute path at scene-load time and parses the rewritten source
+  through the component; the component itself knows nothing about schemes.
+  Any other `scheme:` value is a parse error naming the value.
 
 ## Data scenes
 
@@ -51,13 +61,13 @@ declared mip. Stub tiles carry constant-fill payloads and expand to their
 grid region at every level. Nothing is inferred from file sizes; the
 manifest is the trust anchor, and the GUI parses no DDS, ever.
 
-The shipped `scenes/` files in the repository root point `data` at this
-checkout's export (`D:/git/cd-data-extract/.work/fields/manifest.json`).
-On a machine without that export they fail to load — the error names the
-missing manifest — and the embedded examples remain available; because
-file scenes sort first, the app then opens with the load-error overlay as
-its first view. Copy a shipped scene and point `data` at a local export to
-view other fields.
+The shipped `scenes/` files in the repository root point `data` at
+`config:sdf/manifest.json` — the app's own extracted export. Until extraction
+has run they fail to load with the missing-manifest error (documented
+behavior): the setup panel is the intended first-run view, and after
+extraction the scenes load machine-independently through the data directory
+under the config home. Copy a shipped scene and point `data` at another
+export (file-relative or absolute) to view other fields.
 
 The field texture is a texture array: one layer per grid tile, sized by the
 manifest's mip-0 tile edge. The prelude's field helpers decompose canvas
@@ -68,13 +78,12 @@ helpers stay inert.
 
 `u.params.x` is the mip-level selector (0.0 = mip 0) and `u.params.y` the
 contour-overlay band width (0.0 = pass skipped; otherwise band width in
-field bytes) — see `SdfCanvasState`.
+field bytes) — see `State`.
 
 The component-level contour overlay is a second fragment pass, not a
 scene: it samples the same data texture and alpha-blends contour lines over
 whatever scene is active. It runs only when a data texture is bound and
-`params.y` is on, so embedded examples and scenes with the overlay off are
-untouched.
+`params.y` is on, so scenes with the overlay off are untouched.
 
 ## Recipe scenes
 

@@ -5,6 +5,7 @@ mod button;
 use crate::{
     AppState,
     constants::{
+        NAVIGATION_GAME_FOLDER_BUTTON_ID, NAVIGATION_GAME_FOLDER_LABEL,
         NAVIGATION_HEADER_TEXT_SIZE, NAVIGATION_SCENES_HEADER, NAVIGATION_SELECTOR,
         NAVIGATION_WIDTH,
     },
@@ -20,7 +21,8 @@ use gpui_component::{
 };
 
 /// Vertical strip listing every discoverable SDF scene; clicking one selects
-/// and loads it into the canvas.
+/// and loads it into the canvas. The game-folder button at the bottom reopens
+/// the picker at any time.
 #[derive(IntoElement)]
 pub(crate) struct Navigation {
     app_state: Entity<AppState>,
@@ -37,6 +39,7 @@ impl RenderOnce for Navigation {
         let theme = cx.theme();
         let active = self.app_state.read(cx).active();
         let names = self.app_state.read(cx).scene_names();
+        let offline = self.app_state.read(cx).offline().clone();
 
         let mut list = div().flex().flex_col().gap_2().items_center();
         for (index, name) in names.iter().enumerate() {
@@ -78,6 +81,19 @@ impl RenderOnce for Navigation {
                     .text_color(theme.muted_foreground)
                     .child(NAVIGATION_SCENES_HEADER),
             )
-            .child(list)
+            .child(list.flex_1())
+            .child(
+                div().w_full().flex().justify_center().pb_2().child(
+                    Button::new(NAVIGATION_GAME_FOLDER_BUTTON_ID)
+                        .with_size(NAVIGATION_WIDTH)
+                        .custom(button::variant(false, cx))
+                        .icon(IconName::Folder)
+                        .tooltip(NAVIGATION_GAME_FOLDER_LABEL)
+                        .debug_selector(|| String::from(NAVIGATION_GAME_FOLDER_BUTTON_ID))
+                        .on_click(move |_, _, cx| {
+                            offline.update(cx, |state, cx| state.choose_game_folder(cx));
+                        }),
+                ),
+            )
     }
 }

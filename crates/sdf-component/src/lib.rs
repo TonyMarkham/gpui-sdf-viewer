@@ -11,12 +11,18 @@ mod error;
 mod overlay;
 mod renderer;
 mod scene;
-
-pub use crate::{
-    canvas::{SdfCanvas, SdfCanvasState, sdf_canvas},
-    error::{Error as SdfError, Result as SdfResult},
-    scene::SdfScene,
-};
+pub(crate) mod utilities;
 
 #[cfg(test)]
 mod tests;
+
+// ---------------------------------------------------------------------------------------------- //
+
+pub use crate::{
+    canvas::{
+        Canvas as SdfCanvas, presentation::Presentation, sdf_canvas, state::State as SdfCanvasState,
+    },
+    data::{level::Level, scene_data::SceneData, scene_tile::SceneTile},
+    error::{Error as SdfError, result::Result as SdfResult},
+    scene::SdfScene,
+};

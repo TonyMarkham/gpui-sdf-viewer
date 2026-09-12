@@ -9,7 +9,7 @@ title: Render an SDF frame into a gpui window
 ## What
 
 How a gpui window paints one frame of a signed-distance-field scene: from the
-[`SdfCanvas`](crates/sdf-component/src/canvas.rs) element's paint cycle, through
+[`Canvas`](crates/sdf-component/src/canvas.rs) element's paint cycle, through
 the wgpu renderer, to gpui's image atlas.
 
 ## Why
@@ -22,8 +22,8 @@ frame is an async staging-buffer copy plus a channel swizzle.
 
 ## Who
 
-- `SdfCanvas` (gpui element) — drives the per-frame loop from `paint`
-- `SdfCanvasState` (entity) — owns the renderer, scene, last frame, status,
+- `Canvas` (gpui element) — drives the per-frame loop from `paint`
+- `State` (entity) — owns the renderer, scene, last frame, status,
   and the field controls (`u.params`)
 - `Renderer` (wgpu) — device context, render pipeline, contour overlay
   pass, field texture, staging ring, readback

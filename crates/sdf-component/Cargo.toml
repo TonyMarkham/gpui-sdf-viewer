@@ -11,7 +11,7 @@ pollster              = { workspace = true }
 serde_json            = { workspace = true }
 sha2                  = { workspace = true }
 smallvec              = { workspace = true }
-soul-attr             = { workspace = true }
+soul-attributes       = { workspace = true }
 thiserror             = { workspace = true }
 wgpu                  = { workspace = true }
 

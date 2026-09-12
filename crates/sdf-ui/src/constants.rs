@@ -1,6 +1,6 @@
 use gpui::{Pixels, px};
 
-pub(crate) const APPLICATION_TITLE: &str = "SDF Renderer";
+pub(crate) const APPLICATION_TITLE: &str = "cd-map-offline";
 
 pub const BLUEPRINT_FUNCTIONAL_THEME_JSON: &str =
     include_str!("../assets/themes/blueprint-functional.json");
@@ -9,6 +9,22 @@ pub(crate) const NAVIGATION_SCENES_HEADER: &str = "Scenes";
 
 pub(crate) const SCENE_DIR_ENV: &str = "SDF_SCENES_DIR";
 pub(crate) const SCENE_DIR_DEFAULT: &str = "scenes";
+
+pub(crate) const SETUP_PANEL_SELECTOR: &str = "setup-panel";
+pub(crate) const SETUP_PANEL_MAX_WIDTH: Pixels = px(560.0);
+pub(crate) const SETUP_TEXT_SIZE: Pixels = px(13.0);
+pub(crate) const SETUP_EXPLANATION: &str = "Point cd-map-offline at your Crimson Desert install. The worldmap SDF \
+fields are extracted from the game packs into your user config directory.";
+pub(crate) const SETUP_FOLDER_LABEL: &str = "Game folder:";
+pub(crate) const SETUP_NO_FOLDER: &str = "not set";
+pub(crate) const SETUP_PICKER_LABEL: &str = "Select folder…";
+pub(crate) const SETUP_EXTRACT_LABEL: &str = "Extract now";
+pub(crate) const SETUP_REJECTION_PREFIX: &str = "Rejected: ";
+pub(crate) const SETUP_FAILURE_PREFIX: &str = "Extraction failed: ";
+pub(crate) const SETUP_PICK_BUTTON_ID: &str = "select-folder";
+pub(crate) const SETUP_EXTRACT_BUTTON_ID: &str = "extract-now";
+pub(crate) const NAVIGATION_GAME_FOLDER_LABEL: &str = "Game folder";
+pub(crate) const NAVIGATION_GAME_FOLDER_BUTTON_ID: &str = "game-folder";
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) const WAYLAND_COMPOSITOR_NAME: &str = "Wayland";
@@ -30,6 +46,13 @@ pub(crate) const CANVAS_ERROR_MAX_WIDTH: Pixels = px(640.0);
 pub(crate) const STATUS_SEPARATOR: &str = "  ·  ";
 pub(crate) const STATUS_NO_ADAPTER: &str = "wgpu renderer unavailable";
 pub(crate) const STATUS_NO_SCENE: &str = "No scene selected";
+pub(crate) const STATUS_NO_GAME_FOLDER: &str = "No game folder set";
+pub(crate) const STATUS_GAME_FOLDER_OK: &str = "Game folder ok";
+pub(crate) const STATUS_GAME_FOLDER_INVALID: &str = "Game folder invalid";
+pub(crate) const STATUS_GAME_DATA_MISSING: &str = "Game data missing";
+pub(crate) const STATUS_GAME_FOLDER_BAD: &str = "Game folder rejected: ";
+pub(crate) const STATUS_EXTRACTING: &str = "Extracting: ";
+pub(crate) const STATUS_EXTRACTION_FAILED: &str = "Extraction failed: ";
 
 pub(crate) const CONTROL_BAR_SELECTOR: &str = "control-bar";
 pub(crate) const CONTROL_BAR_HEIGHT: Pixels = px(36.0);
