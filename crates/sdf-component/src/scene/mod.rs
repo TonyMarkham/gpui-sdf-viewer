@@ -21,22 +21,27 @@ use std::path::Path;
 /// // sdf-scene: animated = true
 /// // sdf-scene: data = "manifest.json"
 /// // sdf-scene: layer = "coast"
+/// // sdf-scene: layers = "coast,river,road"
 /// ```
 ///
 /// `name` controls the label shown in the UI; `animated` selects whether the
 /// scene is re-rendered every frame with a running `time` value.
 ///
-/// `data` and `layer` turn the scene into a data scene: `data` names a VS-20
-/// export manifest, resolved relative to the scene file, and `layer` selects
-/// one self-contained entry from the manifest's `layers` array by `name`
-/// (a hard error when absent). The manifest is resolved and structurally
-/// validated at load, and the entry's tile payloads are verified against
-/// their declared sha256 and uploaded into the field texture when it is
-/// first built, at first render; see [`SdfScene::from_file`] and
-/// [`SdfCanvasState`](crate::SdfCanvasState). Scenes created through
-/// [`SdfScene::from_str`] cannot resolve a manifest (there is no file to
-/// resolve against), so the renderer rejects them; data scenes are loaded
-/// from disk through [`SdfScene::from_file`].
+/// `data` pairs with exactly one of `layer` (single-field form) or `layers`
+/// (composite form) and turns the scene into a data scene: `data` names a
+/// VS-20 export manifest, resolved relative to the scene file, and the pair
+/// selects the entries to bind from the manifest's `layers` array by `name`
+/// (a hard error when absent). The `layers` list is comma-separated and its
+/// order is paint order, bottom → top, preserved everywhere; an empty item
+/// in the list is a parse error naming the value. Carrying `layer` and
+/// `layers` together is a parse error. The manifest is resolved and
+/// structurally validated at load, and the entries' tile payloads are
+/// verified against their declared sha256 and uploaded into one field
+/// texture per configured layer when it is first built, at first render; see
+/// [`SdfScene::from_file`] and [`SdfCanvasState`](crate::SdfCanvasState).
+/// Scenes created through [`SdfScene::from_str`] cannot resolve a manifest
+/// (there is no file to resolve against), so the renderer rejects them; data
+/// scenes are loaded from disk through [`SdfScene::from_file`].
 ///
 /// The scene body must define:
 ///
@@ -57,8 +62,10 @@ use std::path::Path;
 ///
 /// The prelude reserves the names `u`, `sd_*`, `op_*`, `rot`, `field`,
 /// `field_lod`, `field_raw`, `field_coord`, `field_uv`, `view_p`,
-/// `FieldCoord`, `t_field`, `s_field`, `s_field_nearest`, and `FIELD_*` for
-/// its helpers; scenes must not define them.
+/// `FieldCoord`, `t_field`, `s_field`, `s_field_nearest`, `FIELD_*`, and —
+/// on composite scenes — the generated per-field names `field_0..n` and
+/// `t_field_0..n` (any name starting with `field_` or `t_field_`) for its
+/// helpers; scenes must not define them.
 #[derive(Clone, Debug)]
 pub struct SdfScene {
     name: String,
@@ -78,6 +85,7 @@ impl SdfScene {
         let mut animated = false;
         let mut manifest: Option<String> = None;
         let mut layer: Option<String> = None;
+        let mut layers: Option<Vec<String>> = None;
         let mut body = String::new();
 
         for line in source.lines() {
@@ -94,6 +102,7 @@ impl SdfScene {
                         "animated" => animated = value.eq_ignore_ascii_case("true"),
                         "data" => manifest = Some(String::from(value)),
                         "layer" => layer = Some(String::from(value)),
+                        "layers" => layers = Some(parse_layers(value)?),
                         _ => {}
                     }
                 }
@@ -104,12 +113,21 @@ impl SdfScene {
             }
         }
 
-        let data_request = match (manifest, layer) {
-            (Some(manifest), Some(layer)) => Some(DataRequest { manifest, layer }),
-            (None, None) => None,
+        let data_request = match (manifest, layer, layers) {
+            (Some(manifest), Some(layer), None) => Some(DataRequest {
+                manifest,
+                layers: vec![layer],
+            }),
+            (Some(manifest), None, Some(layers)) => Some(DataRequest { manifest, layers }),
+            (None, None, None) => None,
+            (_, Some(_), Some(_)) => {
+                return Err(SdfError::scene_invalid(
+                    "the `layer` and `layers` directives are alternatives; a scene must carry exactly one of them",
+                ));
+            }
             _ => {
                 return Err(SdfError::scene_invalid(
-                    "the `data` and `layer` directives are a pair; a scene must carry both or neither",
+                    "the `data` directive pairs with `layer` or `layers`; a scene must carry them together or neither",
                 ));
             }
         };
@@ -149,7 +167,7 @@ impl SdfScene {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(&request.manifest);
-            scene.data = Some(SceneData::load(&manifest_path, &request.layer)?);
+            scene.data = Some(SceneData::load(&manifest_path, &request.layers)?);
         }
 
         Ok(scene)
@@ -180,12 +198,21 @@ impl SdfScene {
         self.data_request.is_some()
     }
 
-    /// Identity of the scene's data binding: the manifest and layer the field
-    /// texture was built from, or `None` for the inert no-data binding.
-    pub(crate) fn data_key(&self) -> Option<String> {
-        self.data
-            .as_ref()
-            .map(|data| format!("{}#{}", data.manifest.display(), data.layer))
+    /// Identity of the scene's data binding: the manifest path and the ordered
+    /// layer names it binds (`manifest#layer1+layer2+…`), or `None` for the
+    /// inert no-data binding. The list is ordered, so the renderer's field
+    /// cache, the skip-unchanged check, and the failure cache distinguish
+    /// every composite from every single-field scene.
+    pub fn data_key(&self) -> Option<String> {
+        self.data.as_ref().map(|data| {
+            let layers = data
+                .fields
+                .iter()
+                .map(|field| field.layer.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
+            format!("{}#{}", data.manifest.display(), layers)
+        })
     }
 
     /// The full WGSL shader module for this scene: prelude (with the field
@@ -198,13 +225,12 @@ impl SdfScene {
         } else {
             MAIN_DEFAULT
         };
-        let (grid, levels) = self
-            .data
-            .as_ref()
-            .map_or((1, 1), |data| (data.grid, data.level_count()));
+        let (grid, levels, fields) = self.data.as_ref().map_or((1, 1, 1), |data| {
+            (data.grid, data.level_count(), data.fields.len())
+        });
         format!(
             "{UNIFORM_BINDINGS}\n{}\n{SDF_HELPERS}\n{}\n{main}",
-            field_helpers(grid, levels),
+            field_helpers(grid, levels, fields),
             self.source
         )
     }
@@ -214,10 +240,13 @@ const HEADER_DIRECTIVE: &str = "// sdf-scene:";
 const SCENE_ENTRY: &str = "fn scene(";
 const RENDER_ENTRY: &str = "fn render(";
 
-/// The uniform block and every field binding. One bind group shape serves
-/// both scene classes: data scenes bind the field texture array, scenes
-/// without data bind a 1×1 zero-filled stand-in so the field helpers stay
-/// inert.
+/// The uniform block and every field binding. Data scenes bind one field
+/// texture array per configured layer: field 0 stays at binding 1 and
+/// fields 1..n take bindings 4, 5, … (0..3 stay uniform + field 0 + two
+/// samplers), generated by [`field_helpers`]. Scenes without data bind a 1×1
+/// zero-filled stand-in so the field helpers stay inert. Single-field scenes
+/// keep the exact binding below (`t_field` at binding 1); only a composite's
+/// bind group carries more than one texture.
 ///
 /// `view_center` (bytes 24..32) is the field-uv point at the viewport center
 /// and `params.z` (bytes 40..44) the zoom factor; together they are the
@@ -240,7 +269,10 @@ pub(crate) const UNIFORM_BINDINGS: &str = r#"struct Uniforms {
 
 /// The field sampling helpers, specialized for one layer geometry: `grid` is
 /// the tile-grid edge (1 for the inert no-data binding) and `levels` the mip
-/// chain length.
+/// chain length. `fields` is the scene's field count: 1 keeps the module
+/// byte-identical to the single-field shape, more than 1 additionally emits
+/// the positional per-field helpers `field_0..n` (fields 1..n-1 with their
+/// own texture bindings at 4, 5, …; field 0 aliasing the base `field`).
 ///
 /// `field_uv` maps canvas coordinates onto the field and applies the pan/zoom
 /// view carried by `u.view_center`/`u.params.z`; `view_p` expresses the same
@@ -252,12 +284,47 @@ pub(crate) const UNIFORM_BINDINGS: &str = r#"struct Uniforms {
 /// both images orient field rows top-down, so the GUI presents the crops
 /// unmirrored. Mirrored output would flip this constant and `view_p`'s
 /// hardcoded y expression below — here and nowhere else.
-pub(crate) fn field_helpers(grid: u32, levels: u32) -> String {
+pub(crate) fn field_helpers(grid: u32, levels: u32, fields: usize) -> String {
     let header =
         format!("const FIELD_TILES: u32 = {grid}u;\nconst FIELD_LEVELS: u32 = {levels}u;\n");
     let mut source = header;
     source.push_str(FIELD_HELPERS);
+    if fields > 1 {
+        // The positional alias for field 0; `field`, `field_lod`, and
+        // `field_raw` stay bound to the first composite layer.
+        source.push_str("\nfn field_0(p: vec2f) -> f32 {\n    return field(p);\n}\n");
+        for index in 1..fields {
+            source.push_str(&field_helper(index));
+        }
+    }
     source
+}
+
+/// One composite field's texture binding and sampling helper: field `index`
+/// binds `t_field_index` at its own binding slot and `field_index(p)` samples
+/// exactly that texture at the effective mip level.
+fn field_helper(index: usize) -> String {
+    let binding = 3 + index as u32;
+    format!(
+        "\n@group(0) @binding({binding}) var t_field_{index}: texture_2d_array<f32>;\n\nfn field_{index}(p: vec2f) -> f32 {{\n    let coord = field_coord(p);\n    return textureSampleLevel(t_field_{index}, s_field, coord.uv, coord.layer, u.params.x).r;\n}}\n"
+    )
+}
+
+/// Parses the `layers` directive's comma-separated list: paint order, bottom
+/// → top, preserved verbatim. An empty item is a parse error naming the
+/// value.
+fn parse_layers(value: &str) -> SdfResult<Vec<String>> {
+    let mut layers = Vec::new();
+    for item in value.split(',') {
+        let name = item.trim();
+        if name.is_empty() {
+            return Err(SdfError::scene_invalid(&format!(
+                "the `layers` directive carries an empty layer name in `{value}`"
+            )));
+        }
+        layers.push(String::from(name));
+    }
+    Ok(layers)
 }
 
 const FIELD_HELPERS: &str = r#"const FIELD_V_FLIP: f32 = 1.0;

@@ -24,6 +24,31 @@ const TEST_PACK: &str = "0012";
 const TEST_PAMT: &str = "0.pamt";
 const TEST_SCENE_A: &str = "// sdf-scene: name = \"Probe A\"\nfn scene(p: vec2f, _time: f32) -> f32 {\n    return sd_circle(p, 0.5);\n}\n";
 const TEST_SCENE_B: &str = "// sdf-scene: name = \"Probe B\"\nfn scene(p: vec2f, _time: f32) -> f32 {\n    return sd_box(p, vec2f(0.3, 0.3));\n}\n";
+const TEST_COMPOSITE_LABEL_SCENE: &str = "// sdf-scene: name = \"Composite\"\nfn scene(p: vec2f, _time: f32) -> f32 {\n    return sd_circle(p, 0.5);\n}\n";
+const TEST_COMPOSITE_LAYERS: &[&str] = &["probe", "echo"];
+
+/// One gray full-strength composite layer over `name` — enough styling for
+/// the layer to stage, load, and paint against the fixture manifest.
+fn layer(name: &str) -> sdf_offline::config::CompositeLayer {
+    sdf_offline::config::CompositeLayer {
+        name: String::from(name),
+        bands: vec![sdf_offline::config::CompositeBand {
+            low: 0.0,
+            high: 255.0,
+            kind: sdf_offline::config::BandKind::Band,
+            ink: [0.5, 0.5, 0.5],
+            weight: 1.0,
+        }],
+    }
+}
+
+/// The fixture manifest's two layers as a composite stack.
+fn fixture_layers() -> Vec<sdf_offline::config::CompositeLayer> {
+    TEST_COMPOSITE_LAYERS
+        .iter()
+        .map(|name| layer(name))
+        .collect()
+}
 const TEST_DATA_SCENE: &str = "// sdf-scene: name = \"Config Probe\"\n// sdf-scene: data = \"config:sdf/manifest.json\"\n// sdf-scene: layer = \"probe\"\nfn render(p: vec2f, _time: f32) -> vec4f {\n    let raw = field_raw(p, u.params.x);\n    return vec4f(vec3f(raw), 1.0);\n}\n";
 const TEST_DATA_SCENE_UNQUOTED: &str = "// sdf-scene: name = \"Config Probe\"\n// sdf-scene: data = config:sdf/manifest.json\n// sdf-scene: layer = \"probe\"\nfn render(p: vec2f, _time: f32) -> vec4f {\n    let raw = field_raw(p, u.params.x);\n    return vec4f(vec3f(raw), 1.0);\n}\n";
 const TEST_DRAINED_PROGRESS: &str = "extract · probe · pack scanned";
@@ -743,6 +768,269 @@ fn an_unknown_data_scheme_is_a_named_scene_error() {
 
 // ------------------------------------------------------------------------------------------ //
 
+/// The defaults stack every recipe route, so the navbar's Composite entry
+/// trails the scene list; an empty array hides the entry entirely.
+#[gpui::test]
+fn the_composite_entry_follows_the_config(cx: &mut TestAppContext) {
+    let fixture = fixture("composite-defaults", cx);
+    write_file(&fixture.scenes.join("probe_a.wgsl"), TEST_SCENE_A);
+    let state = fixture.app_state_with_offline(fixture.offline(), cx);
+
+    let (names, has_composite) = cx.update(|cx| {
+        let state = state.read(cx);
+        (state.scene_names(), state.has_composite())
+    });
+    assert!(
+        has_composite,
+        "the shipped defaults configure the composite"
+    );
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some("Composite"),
+        "the composite entry must trail the alphabetical scenes, got: {names:?}"
+    );
+
+    let state_off = fixture.app_state_with_offline(fixture.offline_with_composite(Vec::new()), cx);
+    let (names, has_composite) = cx.update(|cx| {
+        let state = state_off.read(cx);
+        (state.scene_names(), state.has_composite())
+    });
+    assert!(!has_composite, "an empty stack hides the entry");
+    assert!(
+        !names.contains(&String::from("Composite")),
+        "no synthetic entry may survive an empty stack, got: {names:?}"
+    );
+}
+
+/// Selecting the composite entry stages the generated scene through the
+/// `config:` rewrite path and loads it; the data key lists the configured
+/// layers in paint order.
+#[gpui::test]
+fn selecting_the_composite_entry_loads_the_stacked_scene(cx: &mut TestAppContext) {
+    let fixture = fixture("composite-load", cx);
+    write_file(&fixture.scenes.join("probe_a.wgsl"), TEST_SCENE_A);
+    write_config_manifest(&fixture.root.join(TEST_WORK_DIR));
+
+    let offline = fixture.offline_with_composite(fixture_layers());
+    let state = fixture.app_state_with_offline(offline, cx);
+
+    let composite_index = cx.update(|cx| state.read(cx).scene_names().len() - 1);
+    cx.update(|cx| {
+        state.update(cx, |state, cx| state.select(composite_index, cx));
+    });
+
+    let (name, key, has_data, load_error) = cx.update(|cx| {
+        let state = state.read(cx);
+        let canvas = state.canvas().read(cx);
+        (
+            canvas.scene_name().map(ToString::to_string),
+            canvas.data_key(),
+            canvas.has_data(),
+            state.load_error().map(ToString::to_string),
+        )
+    });
+    assert_eq!(
+        name.as_deref(),
+        Some("Composite"),
+        "the composite entry must load the generated scene"
+    );
+    assert!(has_data, "the composite binds game data");
+    assert!(
+        load_error.is_none(),
+        "a covered layer stack must load cleanly, got: {load_error:?}"
+    );
+    let key = key.unwrap_or_else(|| unreachable!("the composite must bind data"));
+    assert!(
+        key.ends_with("#probe+echo"),
+        "the data key must list the configured layers in paint order, got: {key}"
+    );
+    let manifest_key = fixture
+        .root
+        .join(TEST_WORK_DIR)
+        .join("sdf")
+        .join("manifest.json")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    assert!(
+        key.contains(&manifest_key),
+        "the data key must bind the config manifest, got: {key}"
+    );
+}
+
+/// A config layer that is not an export route stays listed — failures stay
+/// visible, matching scene-list behavior — and surfaces through
+/// `load_error` when the entry is selected.
+#[gpui::test]
+fn an_unknown_composite_layer_surfaces_on_selection(cx: &mut TestAppContext) {
+    let fixture = fixture("composite-unknown", cx);
+    write_config_manifest(&fixture.root.join(TEST_WORK_DIR));
+
+    let state =
+        fixture.app_state_with_offline(fixture.offline_with_composite(vec![layer("ghost")]), cx);
+
+    let names = cx.update(|cx| state.read(cx).scene_names());
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some("Composite"),
+        "the navbar still lists the entry, got: {names:?}"
+    );
+
+    cx.update(|cx| state.update(cx, |state, cx| state.select(0, cx)));
+    let load_error = cx.update(|cx| state.read(cx).load_error().map(ToString::to_string));
+    assert!(
+        load_error
+            .as_deref()
+            .is_some_and(|message| message.contains("ghost")),
+        "an unknown layer must surface through load_error, got: {load_error:?}"
+    );
+}
+
+/// A user scene naming itself "Composite" lists alongside the synthetic
+/// entry as two selectable buttons — discovery stays parse-free and nothing
+/// is reserved; selection is index-based, so both entries work.
+#[gpui::test]
+fn a_user_scene_named_composite_lists_alongside_the_synthetic_entry(cx: &mut TestAppContext) {
+    let fixture = fixture("composite-duplicate", cx);
+    write_file(
+        &fixture.scenes.join("composite.wgsl"),
+        TEST_COMPOSITE_LABEL_SCENE,
+    );
+    write_config_manifest(&fixture.root.join(TEST_WORK_DIR));
+    let state =
+        fixture.app_state_with_offline(fixture.offline_with_composite(fixture_layers()), cx);
+
+    let names = cx.update(|cx| state.read(cx).scene_names());
+    assert_eq!(
+        names,
+        vec![String::from("composite"), String::from("Composite")],
+        "the file scene (by stem) and the synthetic entry list side by side, got: {names:?}"
+    );
+
+    // The file scene binds no data; the synthetic composite lists the
+    // configured layers in order.
+    cx.update(|cx| state.update(cx, |state, cx| state.select(0, cx)));
+    let (file_name, file_key) = cx.update(|cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (
+            canvas.scene_name().map(ToString::to_string),
+            canvas.data_key(),
+        )
+    });
+    assert_eq!(file_name.as_deref(), Some("Composite"));
+    assert!(file_key.is_none(), "the file scene binds no data");
+
+    cx.update(|cx| state.update(cx, |state, cx| state.select(1, cx)));
+    let (synthetic_name, synthetic_key) = cx.update(|cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (
+            canvas.scene_name().map(ToString::to_string),
+            canvas.data_key(),
+        )
+    });
+    assert_eq!(synthetic_name.as_deref(), Some("Composite"));
+    let ordered = synthetic_key
+        .as_deref()
+        .is_some_and(|key| key.ends_with("#probe+echo"));
+    assert!(
+        ordered,
+        "the synthetic entry must list the configured layers in order, got: {synthetic_key:?}"
+    );
+}
+
+/// The generated composite body comes from the config alone: each band's
+/// threshold primitive, ink, and weight interpolate into the render body in
+/// list order, through the positional field helpers.
+#[test]
+fn the_composite_recipes_generate_from_the_config() {
+    use sdf_offline::config::{BandKind, CompositeBand, CompositeLayer};
+
+    let spec = crate::state::scene::CompositeSpec::from_layers(vec![
+        CompositeLayer {
+            name: String::from("river"),
+            bands: vec![
+                CompositeBand {
+                    low: 0.0,
+                    high: 32.0,
+                    kind: BandKind::Band,
+                    ink: [0.1, 0.2, 0.3],
+                    weight: 1.0,
+                },
+                CompositeBand {
+                    low: 32.0,
+                    high: 122.0,
+                    kind: BandKind::Band,
+                    ink: [0.3, 0.45, 0.55],
+                    weight: 1.0,
+                },
+            ],
+        },
+        CompositeLayer {
+            name: String::from("road"),
+            bands: vec![CompositeBand {
+                low: 116.0,
+                high: 136.0,
+                kind: BandKind::Ramp,
+                ink: [0.42, 0.36, 0.28],
+                weight: 0.8,
+            }],
+        },
+    ])
+    .unwrap_or_else(|| unreachable!("a non-empty stack builds a spec"));
+    let source = spec.scene_source();
+
+    // The hard water windows at their config edges and inks, through the
+    // positional helper.
+    assert!(
+        source.contains("let value = field_0(p) * 255.0;"),
+        "the water bands must sample through field 0, got: {source}"
+    );
+    assert!(
+        source.contains("select(0.0, 1.0, value >= 32.0 && value < 122.0)"),
+        "the shelf band must threshold at its config window, got: {source}"
+    );
+    assert!(
+        source.contains("color = mix(color, vec3f(0.3, 0.45, 0.55), coverage * 1.0);"),
+        "the shelf band must mix its config ink at its config weight, got: {source}"
+    );
+
+    // The feature layer: a soft ramp at its config weight, next helper.
+    assert!(
+        source.contains("smoothstep(116.0, 136.0, value)") && source.contains("field_1(p) * 255.0"),
+        "the road band must be a soft ramp through field 1, got: {source}"
+    );
+    assert!(
+        source.contains("color = mix(color, vec3f(0.42, 0.36, 0.28), coverage * 0.8);"),
+        "the ramp must mix its config ink at its config weight, got: {source}"
+    );
+
+    // The paint order rides the config list order.
+    assert!(
+        source.contains("layers = \"river,road\""),
+        "the header must list the configured layers in paint order, got: {source}"
+    );
+
+    // A one-layer composite degrades to the base helper.
+    let one = crate::state::scene::CompositeSpec::from_layers(vec![CompositeLayer {
+        name: String::from("probe"),
+        bands: vec![CompositeBand {
+            low: 0.0,
+            high: 255.0,
+            kind: BandKind::Band,
+            ink: [0.5, 0.5, 0.5],
+            weight: 1.0,
+        }],
+    }])
+    .unwrap_or_else(|| unreachable!("a non-empty stack builds a spec"));
+    assert!(
+        one.scene_source().contains("let value = field(p) * 255.0;"),
+        "a one-layer composite must sample through the base field helper, got: {}",
+        one.scene_source()
+    );
+}
+
+// ------------------------------------------------------------------------------------------ //
+
 /// Bounded wait for the extraction drain: real OS threads feed the channel,
 /// so the test spins parked runs with small sleeps until the outcome lands.
 /// Returns false when the outcome never lands.
@@ -996,7 +1284,9 @@ fn a_dead_extraction_thread_ends_the_drain_with_a_named_error(cx: &mut TestAppCo
 // ------------------------------------------------------------------------------------------ //
 
 /// A minimal VS-20 export manifest under `<config dir>/sdf` with its tile
-/// payloads beside it — what `sdf-app extract` leaves behind.
+/// payloads beside it — what `sdf-app extract` leaves behind. Two layers,
+/// `probe` and `echo`, share the geometry but carry their own payloads with
+/// distinguishable constants (probe stub tile (1, 1) = 42, echo = 84).
 fn write_config_manifest(config_dir: &std::path::Path) -> Vec<u8> {
     let level_bytes = [16u32, 4, 1];
     let tile_payload = |seed: u8| -> Vec<u8> {
@@ -1009,44 +1299,65 @@ fn write_config_manifest(config_dir: &std::path::Path) -> Vec<u8> {
         payload
     };
 
-    let tiles = [
-        ("tile_0_0.r8", 0, 0, "mip0", tile_payload(10)),
-        ("tile_1_0.r8", 1, 0, "mip0", tile_payload(60)),
-        ("tile_0_1.r8", 0, 1, "stub", vec![0u8; 21]),
-        ("tile_1_1.r8", 1, 1, "stub", vec![42u8; 21]),
-    ];
+    let mut layer_entries = Vec::new();
+    for (name, seed, stub) in [("probe", 10u8, 42u8), ("echo", 200u8, 84u8)] {
+        let tiles = [
+            (
+                format!("{}_tile_0_0.r8", name),
+                0,
+                0,
+                "mip0",
+                tile_payload(seed),
+            ),
+            (
+                format!("{}_tile_1_0.r8", name),
+                1,
+                0,
+                "mip0",
+                tile_payload(seed.wrapping_add(50)),
+            ),
+            (format!("{}_tile_0_1.r8", name), 0, 1, "stub", vec![0u8; 21]),
+            (
+                format!("{}_tile_1_1.r8", name),
+                1,
+                1,
+                "stub",
+                vec![stub; 21],
+            ),
+        ];
 
-    let mut manifest_tiles = Vec::new();
-    for (payload_name, x, y, kind, payload) in &tiles {
-        write_bytes(&config_dir.join("sdf").join(payload_name), payload);
-        manifest_tiles.push(json!({
-            "path": format!("ui/{payload_name}"),
-            "payload": payload_name,
-            "x": x,
-            "y": y,
-            "kind": kind,
-            "source_sha256": "0".repeat(64),
-            "payload_sha256": sha256_hex(payload),
+        let mut manifest_tiles = Vec::new();
+        for (payload_name, x, y, kind, payload) in &tiles {
+            write_bytes(&config_dir.join("sdf").join(payload_name), payload);
+            manifest_tiles.push(json!({
+                "path": format!("ui/{payload_name}"),
+                "payload": payload_name,
+                "x": x,
+                "y": y,
+                "kind": kind,
+                "source_sha256": "0".repeat(64),
+                "payload_sha256": sha256_hex(payload),
+            }));
+        }
+
+        layer_entries.push(json!({
+            "name": name,
+            "tile_prefix": "fixture_field",
+            "size": 8,
+            "source_manifest_sha256": "0".repeat(64),
+            "mips": [
+                { "level": 0, "size": 4, "bytes": 16 },
+                { "level": 1, "size": 2, "bytes": 4 },
+                { "level": 2, "size": 1, "bytes": 1 }
+            ],
+            "tiles": manifest_tiles,
         }));
     }
 
     let manifest = json!({
         "format": "cd-map-sdf-field",
         "version": 1,
-        "layers": [
-            {
-                "name": "probe",
-                "tile_prefix": "fixture_field",
-                "size": 8,
-                "source_manifest_sha256": "0".repeat(64),
-                "mips": [
-                    { "level": 0, "size": 4, "bytes": 16 },
-                    { "level": 1, "size": 2, "bytes": 4 },
-                    { "level": 2, "size": 1, "bytes": 1 }
-                ],
-                "tiles": manifest_tiles,
-            }
-        ],
+        "layers": layer_entries,
     });
     let body = serde_json::to_string_pretty(&manifest).unwrap_or_default();
     write_file(&config_dir.join("sdf").join("manifest.json"), &body);

@@ -6,6 +6,9 @@ pub const BLUEPRINT_FUNCTIONAL_THEME_JSON: &str =
     include_str!("../assets/themes/blueprint-functional.json");
 
 pub(crate) const NAVIGATION_SCENES_HEADER: &str = "Scenes";
+pub(crate) const NAVIGATION_COMPOSITE_HEADER: &str = "Composite";
+pub(crate) const NAVIGATION_COMPOSITE_SELECTOR: &str = "navigation-composite";
+pub(crate) const NAVIGATION_COMPOSITE_BUTTON_ID: &str = "composite";
 
 pub(crate) const SCENE_DIR_ENV: &str = "SDF_SCENES_DIR";
 pub(crate) const SCENE_DIR_DEFAULT: &str = "scenes";

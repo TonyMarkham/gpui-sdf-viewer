@@ -6,7 +6,9 @@ pub(crate) use self::extraction_event::ExtractionEvent;
 pub(crate) use self::offline_status::OfflineStatus;
 
 use self::extraction_status::ExtractionStatus;
-use sdf_offline::{Config, OfflineResult, Progress, extract_run, field_run};
+use sdf_offline::{
+    Config, OfflineResult, Progress, config::CompositeLayer, extract_run, field_run,
+};
 
 // ---------------------------------------------------------------------------------------------- //
 
@@ -72,6 +74,12 @@ impl OfflineState {
     /// The resolved data directory — where `config:` scene values point.
     pub(crate) fn data_dir(&self) -> OfflineResult<PathBuf> {
         self.config.paths().map(|paths| paths.data_dir)
+    }
+
+    /// The configured composite layer stack (paint order, bottom → top) with
+    /// each layer's styled bands; empty when the composite view is off.
+    pub(crate) fn composite_layers(&self) -> Vec<CompositeLayer> {
+        self.config.composite.layers.clone()
     }
 
     /// The setup panel is the first-run view: no valid game folder, or no

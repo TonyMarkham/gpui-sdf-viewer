@@ -1,6 +1,9 @@
 use crate::{
     Config, OfflineError, OfflineResult,
-    config::{Extract, Paths, export::Export as ExportConfig, sdf::Sdf as SdfConfig},
+    config::{
+        BandKind, CompositeBand, CompositeLayer, Extract, Paths, export::Export as ExportConfig,
+        sdf::Sdf as SdfConfig,
+    },
     field::grid,
     run,
 };
@@ -11,6 +14,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------------------------- //
+
+/// One gray full-strength composite layer over `name` — enough styling for
+/// the run tests' stacks to pass `check()`.
+fn layer(name: &str) -> CompositeLayer {
+    CompositeLayer {
+        name: String::from(name),
+        bands: vec![CompositeBand {
+            low: 0.0,
+            high: 255.0,
+            kind: BandKind::Band,
+            ink: [0.5, 0.5, 0.5],
+            weight: 1.0,
+        }],
+    }
+}
 
 const TEST_DIR_NAME: &str = "sdf-offline-run";
 const TEST_PREFIX: &str = "cd_worldmap_test_sdf";
@@ -133,6 +151,9 @@ fn pruning_an_include_and_renaming_a_route_change_the_next_run() -> OfflineResul
 
         config.extract.includes = vec![String::from(TEST_INCLUDE)];
         config.sdf.export.extra.clear();
+        // With the hill route gone, the composite stack narrows to the
+        // routes the pruned config still exports.
+        config.composite.layers = vec![layer("coast")];
         run::extract_run(&config, &mut |_| {})?;
         run::field_run(&config, &mut |_| {})?;
         let pruned_extract = std::fs::read(work.join(TEST_EXTRACT_DIR).join(TEST_MANIFEST_NAME))
@@ -258,6 +279,9 @@ fn fixture_config(install: &Path, work: &Path) -> Config {
             )]),
         },
     };
+    // The composite is a view concern; the run tests configure their own
+    // route pair, so the shipped default stack would fail check() here.
+    config.composite.layers = vec![layer("coast"), layer(TEST_HILL_ROUTE)];
     config
 }
 

@@ -46,11 +46,13 @@ fn fs_overlay(in: Varyings) -> @location(0) vec4f {
 /// The contour overlay's WGSL module: the shared uniform block and field
 /// helpers for `grid` tiles and `levels` mip levels, plus the overlay's
 /// kernel. A component-level pass, not a scene: it alpha-blends contour lines
-/// over whatever the scene pass drew, sampling the same data texture.
+/// over whatever the scene pass drew, sampling the same data texture. The
+/// single-field helper shape suffices — the overlay contours the **first**
+/// composite layer, which is what `field_lod` samples.
 #[soul(id = "interaction.sdf.render-frame", step = "contour overlay pass")]
 pub(crate) fn module_source(grid: u32, levels: u32) -> String {
     format!(
         "{UNIFORM_BINDINGS}\n{}\n{OVERLAY_KERNEL}",
-        field_helpers(grid, levels)
+        field_helpers(grid, levels, 1)
     )
 }

@@ -1,6 +1,8 @@
+mod composite;
 mod entry;
 mod origin;
 
+pub(crate) use self::composite::CompositeSpec;
 use self::{entry::SceneEntry, origin::SceneOrigin};
 use crate::{
     UiError, UiResult,

@@ -56,11 +56,15 @@ Scenes rendered through this flow follow [[concept.sdf-scene-contract]].
    pans with the cursor, and the mouse-up ends the drag wherever it released.
    The view state lives on `State` in field-uv space and clamps so the field
    always covers the viewport.
-2. The renderer aligns the field texture with the scene's data: a data
-   scene's tiles are read, sha256-verified, length-checked, and uploaded
-   into a texture array (one layer per grid tile, one mip level per declared
-   mip) when the scene changed; a scene without data rebinds the inert 1×1
-   stub. A failed upload is recorded with the data identity that failed and
+2. The renderer aligns the bound field textures with the scene's data: a
+   data scene's tiles are read, sha256-verified, length-checked, and
+   uploaded into one field texture array per configured layer (one layer
+   per grid tile, one mip level per declared mip; a composite binds one
+   texture per configured layer, field 0 at binding 1) when the scene
+   changed; a scene without data rebinds the inert 1×1 stub. The
+   bind-group layout and both pipelines recompile whenever the scene's
+   field count differs from the layout's. A failed upload is recorded with
+   the data identity that failed and
    re-raised on every subsequent paint without re-reading the payloads —
    the failure is deterministic, so re-attempting it would only re-read and
    re-hash the layer each frame. Fixing a corrupt payload on disk therefore
@@ -75,8 +79,12 @@ Scenes rendered through this flow follow [[concept.sdf-scene-contract]].
    `log2(zoom)`, clamped to the chain.
 4. `map_async` completions are drained by `device.poll(Maintain::Poll)`; a
    finished slot becomes a BGRA `RenderImage` frame.
-5. Back in `paint`, the new frame is drawn with `window.paint_image` and the
-   previous frame is released with `window.drop_image` (keeps the atlas bounded).
+5. Back in `paint`, the frame is drawn with `window.paint_image` — the new
+   frame when one landed, otherwise the last presented one (the display
+   list is rebuilt on every repaint, so a repaint that paints nothing would
+   blank the canvas; compile errors keep presenting the last good frame) —
+   and the replaced frame is released with `window.drop_image` (keeps the
+   atlas bounded).
 6. If the scene is animated — or a submission is still in flight — the element
    calls `window.request_animation_frame()` to keep the loop running.
 

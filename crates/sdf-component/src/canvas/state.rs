@@ -178,6 +178,12 @@ impl State {
             .is_some_and(|scene| scene.data().is_some())
     }
 
+    /// Identity of the active scene's data binding, if any: the manifest and
+    /// the ordered layer names it binds (see `SdfScene::data_key`).
+    pub fn data_key(&self) -> Option<String> {
+        self.scene.as_ref().and_then(SdfScene::data_key)
+    }
+
     /// Number of mip levels the active scene's data declares, for UI ranges.
     pub fn field_level_count(&self) -> Option<u32> {
         self.scene

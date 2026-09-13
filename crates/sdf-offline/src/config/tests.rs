@@ -2,6 +2,7 @@ use super::{Config, DEFAULT_TEMPLATE};
 
 // ---------------------------------------------------------------------------------------------- //
 
+use crate::config::{BandKind, CompositeBand, CompositeLayer};
 use crate::tests::{ensure, ensure_message};
 use crate::{OfflineError, OfflineResult};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ const TEST_HAND_TUNED_INCLUDE: &str = "cd_worldmap_test_sdf*";
 const TEST_MISSING_ROOT: &str = "Q:/nowhere";
 const TEST_PAMT_TABLE: &str = "0.pamt";
 const TEST_COLLIDING_ROUTE: &str = "coast";
+const TEST_UNKNOWN_COMPOSITE_LAYER: &str = "not_a_route";
+const TEST_HAND_TUNED_COMPOSITE_COMMENT: &str = "# my composite, hands off";
 
 // ---------------------------------------------------------------------------------------------- //
 
@@ -242,6 +245,230 @@ fn check_rejects_empty_includes() -> OfflineResult<()> {
 #[test]
 fn check_accepts_the_defaults() -> OfflineResult<()> {
     Config::defaults().check()
+}
+
+#[test]
+fn the_default_composite_paints_the_water_up_to_the_shore() -> OfflineResult<()> {
+    let layers = &Config::defaults().composite.layers;
+    let names: Vec<&str> = layers.iter().map(|layer| layer.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["river", "coast", "road", "mountain", "road_wagon"],
+        "the shipped default palette must paint water first, then the shore line, then the features"
+    );
+
+    // The water fill must cover every byte below the shore line — closing
+    // both the sub-32 lake voids and the 108-122 shore moat.
+    let water_windows: Vec<(f32, f32)> = layers[0]
+        .bands
+        .iter()
+        .map(|band| (band.low, band.high))
+        .collect();
+    assert_eq!(
+        water_windows,
+        vec![(0.0, 32.0), (32.0, 122.0)],
+        "the water layer must fill every byte below the shore transition"
+    );
+
+    // The shore edge reads the transition strip only, not the landmass.
+    let shore = &layers[1].bands[0];
+    ensure(
+        shore.low == 122.0 && shore.high == 132.0,
+        "the shore layer must band the 122..132 transition strip",
+    )?;
+    ensure(
+        shore.kind == BandKind::Band,
+        "the shore layer must use the hard band primitive",
+    )
+}
+
+#[test]
+fn check_rejects_a_composite_layer_no_route_names() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    config.composite.layers.push(CompositeLayer {
+        name: String::from(TEST_UNKNOWN_COMPOSITE_LAYER),
+        bands: vec![band(0.0, 255.0)],
+    });
+
+    match config.check() {
+        Err(error) => ensure_message(
+            &error,
+            "is not an export route",
+            TEST_UNKNOWN_COMPOSITE_LAYER,
+            "an unknown composite layer must be rejected",
+        ),
+        Ok(_) => Err(OfflineError::toml(
+            "an unknown composite layer passed check",
+        )),
+    }
+}
+
+#[test]
+fn check_rejects_a_duplicate_composite_layer() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    // Layer 2 (road) renamed to coast duplicates layer 1.
+    config.composite.layers[2].name = String::from(TEST_COLLIDING_ROUTE);
+
+    match config.check() {
+        Err(error) => ensure_message(
+            &error,
+            "is listed twice",
+            TEST_COLLIDING_ROUTE,
+            "a duplicated composite layer must be rejected",
+        ),
+        Ok(_) => Err(OfflineError::toml(
+            "a duplicated composite layer passed check",
+        )),
+    }
+}
+
+#[test]
+fn check_rejects_a_layer_without_bands() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    config.composite.layers[0].bands.clear();
+
+    match config.check() {
+        Err(error) => ensure_message(
+            &error,
+            "carries no bands",
+            "river",
+            "a layer without bands must be rejected",
+        ),
+        Ok(_) => Err(OfflineError::toml("a bandless layer passed check")),
+    }
+}
+
+#[test]
+fn check_rejects_a_band_low_above_high() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    config.composite.layers[0].bands[0].low = 200.0;
+    config.composite.layers[0].bands[0].high = 40.0;
+
+    match config.check() {
+        Err(error) => ensure_message(
+            &error,
+            "is above high",
+            "river",
+            "an inverted band window must be rejected",
+        ),
+        Ok(_) => Err(OfflineError::toml("an inverted band window passed check")),
+    }
+}
+
+#[test]
+fn check_rejects_a_band_value_outside_the_byte_range() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    config.composite.layers[0].bands[0].high = 300.0;
+
+    match config.check() {
+        Err(error) => ensure_message(
+            &error,
+            "is outside 0..=255",
+            "river",
+            "a band edge beyond the byte range must be rejected",
+        ),
+        Ok(_) => Err(OfflineError::toml(
+            "a band value outside the byte range passed check",
+        )),
+    }
+}
+
+#[test]
+fn check_rejects_a_band_weight_outside_the_unit_range() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    config.composite.layers[2].bands[0].weight = 1.5;
+
+    match config.check() {
+        Err(error) => ensure_message(
+            &error,
+            "band weight 1.5 is outside 0..=1",
+            "road",
+            "a band weight outside 0..=1 must be rejected",
+        ),
+        Ok(_) => Err(OfflineError::toml(
+            "a band weight outside 0..=1 passed check",
+        )),
+    }
+}
+
+#[test]
+fn check_rejects_a_band_ink_component_outside_the_unit_range() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    config.composite.layers[1].bands[0].ink[1] = 1.4;
+
+    match config.check() {
+        Err(error) => ensure_message(
+            &error,
+            "band ink component 1 1.4 is outside 0..=1",
+            "coast",
+            "an ink component outside 0..=1 must be rejected",
+        ),
+        Ok(_) => Err(OfflineError::toml(
+            "an ink component outside 0..=1 passed check",
+        )),
+    }
+}
+
+#[test]
+fn check_accepts_an_empty_composite() -> OfflineResult<()> {
+    let mut config = Config::defaults();
+    config.composite.layers.clear();
+    config.check()
+}
+
+#[test]
+fn a_hand_tuned_composite_survives_a_gui_save() -> OfflineResult<()> {
+    let path = test_path("hand-tuned-composite");
+    std::fs::write(
+        &path,
+        format!(
+            "{TEST_HAND_TUNED_COMPOSITE_COMMENT}\n[paths]\ngame_root = \"\"\n\n\
+             [composite]\n# my stack, hands off\n[[composite.layer]]\nname = \"coast\"\n\
+             bands = [{{ low = 120.0, high = 140.0, kind = \"band\", ink = [0.2, 0.3, 0.4], weight = 0.5 }}]\n"
+        ),
+    )
+    .map_err(|e| OfflineError::io(format!("write test config: {e}")))?;
+
+    let mut config = Config::load_from(&path)?;
+    config.paths.game_root = String::from(TEST_GAME_ROOT);
+    config.save_to(&path)?;
+
+    let saved = std::fs::read_to_string(&path)
+        .map_err(|e| OfflineError::io(format!("read saved config: {e}")))?;
+    ensure(
+        saved.contains(TEST_HAND_TUNED_COMPOSITE_COMMENT),
+        "the hand-tuned leading comment must survive the save",
+    )?;
+    ensure(
+        saved.contains("[[composite.layer]]") && saved.contains("# my stack, hands off"),
+        "the hand-tuned composite layer must survive the save",
+    )?;
+
+    let reloaded = Config::load_from(&path)?;
+    ensure(
+        reloaded.composite.layers.len() == 1
+            && reloaded.composite.layers[0].name == "coast"
+            && reloaded.composite.layers[0].bands[0].low == 120.0,
+        "the hand-tuned composite layer must reload with its band intact",
+    )?;
+
+    let _ = std::fs::remove_file(&path);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------- //
+
+/// One full-strength gray band covering `low..high` — enough styling for a
+/// layer to pass the structural checks.
+fn band(low: f32, high: f32) -> CompositeBand {
+    CompositeBand {
+        low,
+        high,
+        kind: BandKind::Band,
+        ink: [0.5, 0.5, 0.5],
+        weight: 1.0,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- //

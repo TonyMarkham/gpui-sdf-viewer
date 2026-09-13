@@ -30,9 +30,21 @@ fn render_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// A minimal VS-20 export fixture: a 2×2 grid of 4² tiles over an 8² field,
-/// three mip levels per real tile, constant-fill stubs. Returns the fixture
-/// directory on success.
+/// three mip levels per real tile, constant-fill stubs. Two layers — `probe`
+/// and `echo` — share the geometry but carry their own payloads with
+/// distinguishable constants (probe stub tile (1, 1) = 42, echo = 84).
+/// Returns the fixture directory on success.
 fn field_fixture(tag: &str) -> std::result::Result<std::path::PathBuf, String> {
+    field_fixture_with_layers(tag, 0)
+}
+
+/// Like [`field_fixture`] with `extra` additional layers reusing echo's
+/// payloads under generated names — enough layer entries to push a composite
+/// past the device's sampled-texture limit.
+fn field_fixture_with_layers(
+    tag: &str,
+    extra: usize,
+) -> std::result::Result<std::path::PathBuf, String> {
     let dir = std::env::temp_dir()
         .join(format!("sdf-field-fixture-{tag}-{}", std::process::id()))
         .join("fields");
@@ -49,46 +61,70 @@ fn field_fixture(tag: &str) -> std::result::Result<std::path::PathBuf, String> {
         payload
     };
 
-    let tiles = [
+    let probe_tiles: [(&str, u32, u32, &str, Vec<u8>); 4] = [
         ("tile_0_0.r8", 0, 0, "mip0", tile_payload(10)),
         ("tile_1_0.r8", 1, 0, "mip0", tile_payload(60)),
         ("tile_0_1.r8", 0, 1, "stub", vec![0u8; 21]),
         ("tile_1_1.r8", 1, 1, "stub", vec![42u8; 21]),
     ];
+    let echo_tiles: [(&str, u32, u32, &str, Vec<u8>); 4] = [
+        ("echo_tile_0_0.r8", 0, 0, "mip0", tile_payload(200)),
+        ("echo_tile_1_0.r8", 1, 0, "mip0", tile_payload(210)),
+        ("echo_tile_0_1.r8", 0, 1, "stub", vec![7u8; 21]),
+        ("echo_tile_1_1.r8", 1, 1, "stub", vec![84u8; 21]),
+    ];
 
-    let mut manifest_tiles = Vec::new();
-    for (payload_name, x, y, kind, payload) in &tiles {
-        let payload_path = dir.join(payload_name);
-        std::fs::write(&payload_path, payload)
-            .map_err(|error| format!("write {payload_name}: {error}"))?;
-        manifest_tiles.push(json!({
-            "path": format!("ui/{payload_name}"),
-            "payload": payload_name,
-            "x": x,
-            "y": y,
-            "kind": kind,
-            "source_sha256": "0".repeat(64),
-            "payload_sha256": sha256_hex(payload),
-        }));
+    let manifest_tiles =
+        |tiles: &[(&str, u32, u32, &str, Vec<u8>)]| -> std::result::Result<Vec<serde_json::Value>, String> {
+            let mut entries = Vec::new();
+            for (payload_name, x, y, kind, payload) in tiles {
+                let payload_path = dir.join(payload_name);
+                std::fs::write(&payload_path, payload)
+                    .map_err(|error| format!("write {payload_name}: {error}"))?;
+                entries.push(json!({
+                    "path": format!("ui/{payload_name}"),
+                    "payload": payload_name,
+                    "x": x,
+                    "y": y,
+                    "kind": kind,
+                    "source_sha256": "0".repeat(64),
+                    "payload_sha256": sha256_hex(payload),
+                }));
+            }
+            Ok(entries)
+        };
+
+    let layer_entry = |name: &str, tiles: &[serde_json::Value]| -> serde_json::Value {
+        json!({
+            "name": name,
+            "tile_prefix": "fixture_field",
+            "size": 8,
+            "source_manifest_sha256": "0".repeat(64),
+            "mips": [
+                { "level": 0, "size": 4, "bytes": 16 },
+                { "level": 1, "size": 2, "bytes": 4 },
+                { "level": 2, "size": 1, "bytes": 1 }
+            ],
+            "tiles": tiles,
+        })
+    };
+
+    let probe_manifest_tiles = manifest_tiles(&probe_tiles)?;
+    let echo_manifest_tiles = manifest_tiles(&echo_tiles)?;
+    let mut layers = vec![
+        layer_entry("probe", &probe_manifest_tiles),
+        layer_entry("echo", &echo_manifest_tiles),
+    ];
+    for index in 0..extra {
+        let mut entry = layer_entry("echo", &echo_manifest_tiles);
+        entry["name"] = json!(format!("echo_{index}"));
+        layers.push(entry);
     }
 
     let manifest = json!({
         "format": "cd-map-sdf-field",
         "version": 1,
-        "layers": [
-            {
-                "name": "probe",
-                "tile_prefix": "fixture_field",
-                "size": 8,
-                "source_manifest_sha256": "0".repeat(64),
-                "mips": [
-                    { "level": 0, "size": 4, "bytes": 16 },
-                    { "level": 1, "size": 2, "bytes": 4 },
-                    { "level": 2, "size": 1, "bytes": 1 }
-                ],
-                "tiles": manifest_tiles,
-            }
-        ],
+        "layers": layers,
     });
     std::fs::write(
         dir.join("manifest.json"),
@@ -122,6 +158,32 @@ fn data_scene(
          return vec4f(vec3f(raw), 1.0);\n}}\n"
     );
     let path = dir.join("probe.wgsl");
+    std::fs::write(&path, &source)
+        .map_err(|error| Error::data(&format!("write scene file: {error}")))?;
+    SdfScene::from_file(&path)
+}
+
+/// The body the composite render tests sample through: the brightest of the
+/// first two fields, so a frame that only bound field 0 is distinguishable
+/// from one that bound both.
+/// The body the composite render tests sample through: the brightest of the
+/// first two fields (normalized values, so the raw byte is the texel value).
+const COMPOSITE_BODY: &str = "fn render(p: vec2f, _time: f32) -> vec4f {\n    \
+     let mixed = max(field_0(p), field_1(p));\n    \
+     return vec4f(vec3f(mixed), 1.0);\n}\n";
+
+/// Writes a composite data scene (`layers` = comma-separated paint order)
+/// referencing `manifest_name` beside itself and parses it from disk.
+fn composite_scene(
+    dir: &Path,
+    layers: &str,
+    manifest_name: &str,
+    body: &str,
+) -> std::result::Result<SdfScene, Error> {
+    let source = format!(
+        "// sdf-scene: data = \"{manifest_name}\"\n// sdf-scene: layers = \"{layers}\"\n{body}"
+    );
+    let path = dir.join("composite.wgsl");
     std::fs::write(&path, &source)
         .map_err(|error| Error::data(&format!("write scene file: {error}")))?;
     SdfScene::from_file(&path)
@@ -280,6 +342,238 @@ fn data_directives_are_a_pair() {
     assert!(
         layer_only.is_err(),
         "a `layer` directive without `data` must be rejected"
+    );
+}
+
+#[test]
+fn the_layers_directive_pairs_with_data() {
+    let pair = SdfScene::from_str(
+        "// sdf-scene: data = \"manifest.json\"\n// sdf-scene: layers = \"coast,river\"\nfn scene(p: vec2f, _time: f32) -> f32 { return 0.0; }",
+        "layers-pair",
+    );
+    assert!(pair.is_ok(), "data + layers directives parse together");
+
+    let layers_only = SdfScene::from_str(
+        "// sdf-scene: layers = \"coast\"\nfn scene(p: vec2f, _time: f32) -> f32 { return 0.0; }",
+        "layers-only",
+    );
+    assert!(
+        layers_only.is_err(),
+        "a `layers` directive without `data` must be rejected"
+    );
+}
+
+#[test]
+fn carrying_layer_and_layers_together_is_a_parse_error() {
+    let with_data = SdfScene::from_str(
+        "// sdf-scene: data = \"manifest.json\"\n// sdf-scene: layer = \"coast\"\n// sdf-scene: layers = \"coast,river\"\nfn scene(p: vec2f, _time: f32) -> f32 { return 0.0; }",
+        "both",
+    );
+    assert!(
+        with_data.is_err(),
+        "`layer` and `layers` together must be rejected"
+    );
+
+    let without_data = SdfScene::from_str(
+        "// sdf-scene: layer = \"coast\"\n// sdf-scene: layers = \"coast\"\nfn scene(p: vec2f, _time: f32) -> f32 { return 0.0; }",
+        "both",
+    );
+    assert!(
+        without_data.is_err(),
+        "`layer` and `layers` together must be rejected"
+    );
+}
+
+#[test]
+fn an_empty_layers_item_is_a_parse_error_naming_the_value() {
+    let failure = match SdfScene::from_str(
+        "// sdf-scene: data = \"manifest.json\"\n// sdf-scene: layers = \"coast,,river\"\nfn scene(p: vec2f, _time: f32) -> f32 { return 0.0; }",
+        "empty-item",
+    ) {
+        Err(error) => error.to_string(),
+        Ok(_) => String::new(),
+    };
+    assert!(
+        failure.contains("coast,,river"),
+        "an empty `layers` item must be a parse error naming the value, got: {failure}"
+    );
+}
+
+/// The `layers` list is paint order, preserved everywhere — resolved into
+/// the fields and out into the data key.
+#[test]
+fn layers_order_survives_into_the_data_key() {
+    let dir = match field_fixture("key-order") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping key-order test: {error}");
+            return;
+        }
+    };
+    let scene = match composite_scene(&dir, "echo,probe", "manifest.json", COMPOSITE_BODY) {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected composite-scene load failure: {error}"),
+    };
+    let key = scene
+        .data_key()
+        .unwrap_or_else(|| unreachable!("the loaded composite must carry a data key"));
+    assert!(
+        key.ends_with("#echo+probe"),
+        "the data key must list the configured layers in paint order, got: {key}"
+    );
+}
+
+/// A two-layer manifest resolves both fields against the shared geometry:
+/// one grid, one mip chain, fields in paint order.
+#[test]
+fn a_two_layer_manifest_resolves_both_fields() {
+    let dir = match field_fixture("two-fields") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping two-fields test: {error}");
+            return;
+        }
+    };
+    let scene = match composite_scene(&dir, "probe,echo", "manifest.json", COMPOSITE_BODY) {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected composite-scene load failure: {error}"),
+    };
+    let data = match scene.data() {
+        Some(data) => data,
+        None => unreachable!("unexpected: the composite scene resolved no data"),
+    };
+    assert_eq!(data.grid, 2, "the fixture declares a shared 2×2 grid");
+    assert_eq!(data.level_count(), 3, "the fixture declares three levels");
+    assert_eq!(data.fields.len(), 2, "both configured layers must resolve");
+    assert_eq!(data.fields[0].layer, "probe", "paint order is preserved");
+    assert_eq!(data.fields[1].layer, "echo", "paint order is preserved");
+}
+
+/// A composite's fields share the first field's geometry: a grid mismatch,
+/// a mip-level count mismatch, or — byte-exact — a mip table with equal
+/// counts but different sizes must each fail naming both fields.
+#[test]
+fn mismatched_field_geometry_is_an_error_naming_both_fields() {
+    let dir = match field_fixture("mismatch") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping geometry-mismatch test: {error}");
+            return;
+        }
+    };
+    let manifest: serde_json::Value = match std::fs::read_to_string(dir.join("manifest.json"))
+        .map_err(|error| error.to_string())
+        .and_then(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("skipping geometry-mismatch test: {error}");
+            return;
+        }
+    };
+
+    // Grid mismatch: echo's field is a 4×4 grid of the same tile edge.
+    let mut grid_variant = manifest.clone();
+    grid_variant["layers"][1]["size"] = json!(16);
+    let failure = match composite_variant(&dir, &grid_variant, "mismatch-grid") {
+        Err(error) => Some(error.to_string()),
+        Ok(_) => None,
+    };
+    assert!(
+        failure
+            .as_deref()
+            .is_some_and(|message| message.contains("differs from field \"probe\"")
+                && message.contains("field \"echo\"")),
+        "a grid mismatch must name both fields, got: {failure:?}"
+    );
+
+    // Mip-level count mismatch: echo declares a two-level chain.
+    let mut count_variant = manifest.clone();
+    count_variant["layers"][1]["mips"] = json!([
+        { "level": 0, "size": 4, "bytes": 16 },
+        { "level": 1, "size": 2, "bytes": 4 }
+    ]);
+    let failure = match composite_variant(&dir, &count_variant, "mismatch-count") {
+        Err(error) => Some(error.to_string()),
+        Ok(_) => None,
+    };
+    assert!(
+        failure.as_deref().is_some_and(
+            |message| message.contains("mip level count 2 differs from field \"probe\": 3")
+        ),
+        "a mip-level count mismatch must be reported with both fields, got: {failure:?}"
+    );
+
+    // Byte-exact mip table mismatch: same count, same grid, but echo's tile
+    // edge is 8² instead of 4² — its level sizes differ at the first level.
+    let mut edge_variant = manifest.clone();
+    edge_variant["layers"][1]["size"] = json!(16);
+    edge_variant["layers"][1]["mips"] = json!([
+        { "level": 0, "size": 8, "bytes": 64 },
+        { "level": 1, "size": 4, "bytes": 16 },
+        { "level": 2, "size": 2, "bytes": 4 }
+    ]);
+    let failure = match composite_variant(&dir, &edge_variant, "mismatch-edge") {
+        Err(error) => Some(error.to_string()),
+        Ok(_) => None,
+    };
+    assert!(
+        failure.as_deref().is_some_and(
+            |message| message.contains("mip level 0 size 8 differs from field \"probe\": 4")
+        ),
+        "a divergent mip table must name the first divergent pair, got: {failure:?}"
+    );
+}
+
+/// Writes `manifest` as a tagged variant beside the fixture payloads and
+/// parses a probe+echo composite against it.
+fn composite_variant(
+    dir: &Path,
+    manifest: &serde_json::Value,
+    tag: &str,
+) -> std::result::Result<SdfScene, Error> {
+    let name = format!("manifest-{tag}.json");
+    std::fs::write(
+        dir.join(&name),
+        serde_json::to_string(manifest).unwrap_or_default(),
+    )
+    .map_err(|error| Error::data(&format!("write variant manifest: {error}")))?;
+    composite_scene(dir, "probe,echo", &name, COMPOSITE_BODY)
+}
+
+/// The composite prelude emits the positional helpers next to the single-
+/// field constants; a single-field scene's module stays free of them.
+#[test]
+fn the_composite_prelude_emits_per_field_helpers() {
+    let dir = match field_fixture("prelude") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping prelude test: {error}");
+            return;
+        }
+    };
+    let composite = match composite_scene(&dir, "probe,echo", "manifest.json", COMPOSITE_BODY) {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected composite-scene load failure: {error}"),
+    };
+    let module = composite.module_source();
+    assert!(
+        module.contains("@group(0) @binding(4) var t_field_1"),
+        "field 1 must bind its own texture at binding 4, got: {module}"
+    );
+    assert!(
+        module.contains("fn field_0(") && module.contains("fn field_1("),
+        "the positional helpers must be generated, got: {module}"
+    );
+
+    let single = match data_scene(&dir, "probe", "manifest.json") {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected data-scene load failure: {error}"),
+    };
+    let module = single.module_source();
+    assert!(
+        !module.contains("t_field_1") && !module.contains("fn field_0("),
+        "a single-field scene must compile to today's module, got: {module}"
     );
 }
 
@@ -752,6 +1046,211 @@ fn a_view_change_settles_on_the_newest_submitted_frame() {
     assert!(
         settled_frame.is_none(),
         "a settled, unchanged repaint must not supply another frame"
+    );
+}
+
+/// A two-layer composite scene binds one field texture per configured
+/// layer: the frame carries the brighter of the two fields' constants, so a
+/// regression to a single-texture bind group (or a swapped pair) fails
+/// through the pixels. Skipped (with a note) when no wgpu adapter is
+/// available.
+#[test]
+fn a_composite_scene_renders_with_per_field_textures() {
+    let _renderer_lock = render_lock();
+    let dir = match field_fixture("composite-render") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping composite-render test: {error}");
+            return;
+        }
+    };
+    let scene = match composite_scene(&dir, "probe,echo", "manifest.json", COMPOSITE_BODY) {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected composite-scene load failure: {error}"),
+    };
+    let mut renderer = match Renderer::new() {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            eprintln!("skipping composite-render test: {error}");
+            return;
+        }
+    };
+
+    let frame = match require_frame(
+        first_frame(&mut renderer, &scene, [0.0, 0.0]),
+        "the composite scene failed to render",
+    ) {
+        Some(frame) => frame,
+        None => {
+            eprintln!("skipping composite-render test: no frame became ready in time");
+            return;
+        }
+    };
+    let bytes = match frame.as_bytes(0) {
+        Some(bytes) => bytes,
+        None => unreachable!("unexpected: the composite frame has no bytes"),
+    };
+
+    const SIZE: u32 = 64;
+    let red_at = |x: u32, y: u32| bytes[((y * SIZE + x) * 4 + 2) as usize];
+    assert_eq!(
+        red_at(SIZE / 2, SIZE / 2),
+        84,
+        "the frame center must sample the brightest of the two stub tiles (42, 84)"
+    );
+    // In-tile uv 0.5 sits exactly between echo's mip0 texels (1, 1) = 206 and
+    // (2, 2) = 210 under linear filtering: the frame mixes them to 208 —
+    // which only field 1 (echo) can reach, probe's mix there is 18.
+    assert_eq!(
+        red_at(SIZE / 4, SIZE / 4),
+        208,
+        "tile (0, 0) must show echo's mip0 texels mixed by the linear sampler"
+    );
+}
+
+/// Switching composite → single → composite on one renderer must rebuild
+/// the bind-group shape and rebind per-field textures each time: the ordered
+/// data key pins the skip-unchanged check, and the pixels must follow the
+/// scene class of the moment. Skipped (with a note) when no adapter is
+/// available.
+#[test]
+fn a_composite_to_single_to_composite_switch_rebuilds_the_bind_group_shape() {
+    let _renderer_lock = render_lock();
+    let dir = match field_fixture("composite-switch") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping composite-switch test: {error}");
+            return;
+        }
+    };
+    let composite = match composite_scene(&dir, "probe,echo", "manifest.json", COMPOSITE_BODY) {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected composite-scene load failure: {error}"),
+    };
+    let single = match data_scene(&dir, "probe", "manifest.json") {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected data-scene load failure: {error}"),
+    };
+    assert_ne!(
+        composite.data_key(),
+        single.data_key(),
+        "the ordered data keys must distinguish composite from single-field"
+    );
+    let mut renderer = match Renderer::new() {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            eprintln!("skipping composite-switch test: {error}");
+            return;
+        }
+    };
+
+    const SIZE: u32 = 64;
+    let center_red = |frame: &std::sync::Arc<gpui::RenderImage>| -> u8 {
+        require_bytes(frame, "the switch-test frame")
+            [((SIZE / 2 * SIZE + SIZE / 2) * 4 + 2) as usize]
+    };
+
+    let composite_frame = match require_frame(
+        first_frame(&mut renderer, &composite, [0.0, 0.0]),
+        "the composite scene failed to render",
+    ) {
+        Some(frame) => frame,
+        None => {
+            eprintln!("skipping composite-switch test: no composite frame became ready in time");
+            return;
+        }
+    };
+    assert_eq!(
+        center_red(&composite_frame),
+        84,
+        "the composite must render both fields' stub constants"
+    );
+
+    let single_frame = match require_frame(
+        first_frame(&mut renderer, &single, [0.0, 0.0]),
+        "the single-field scene failed to render after the composite",
+    ) {
+        Some(frame) => frame,
+        None => {
+            eprintln!("skipping composite-switch test: no single-field frame became ready in time");
+            return;
+        }
+    };
+    assert_eq!(
+        center_red(&single_frame),
+        42,
+        "the single-field scene must render only its own field"
+    );
+
+    let again_frame = match require_frame(
+        first_frame(&mut renderer, &composite, [0.0, 0.0]),
+        "the composite scene failed to render after switching back",
+    ) {
+        Some(frame) => frame,
+        None => {
+            eprintln!(
+                "skipping composite-switch test: no second composite frame became ready in time"
+            );
+            return;
+        }
+    };
+    assert_eq!(
+        center_red(&again_frame),
+        84,
+        "switching back must restore the composite's per-field bindings"
+    );
+}
+
+/// A field count above the device's sampled-texture limit must be rejected
+/// with the limit named, never truncated. The renderer requests
+/// `wgpu::Limits::default()`, so 20 fields exceed the granted
+/// `max_sampled_textures_per_shader_stage` on any host. Skipped (with a
+/// note) when no wgpu adapter is available.
+#[test]
+fn a_field_count_above_the_device_limit_is_rejected_with_the_limit_named() {
+    let _renderer_lock = render_lock();
+    let dir = match field_fixture_with_layers("limit-fields", 18) {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping field-limit test: {error}");
+            return;
+        }
+    };
+    let mut layer_names = vec![String::from("probe"), String::from("echo")];
+    for index in 0..18 {
+        layer_names.push(format!("echo_{index}"));
+    }
+    let scene = match composite_scene(
+        &dir,
+        &layer_names.join(","),
+        "manifest.json",
+        COMPOSITE_BODY,
+    ) {
+        Ok(scene) => scene,
+        Err(error) => unreachable!("unexpected composite-scene load failure: {error}"),
+    };
+    assert_eq!(
+        scene.data().map(|data| data.fields.len()),
+        Some(20),
+        "the fixture must resolve twenty fields"
+    );
+
+    let mut renderer = match Renderer::new() {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            eprintln!("skipping field-limit test: {error}");
+            return;
+        }
+    };
+    let failure = match first_frame(&mut renderer, &scene, [0.0, 0.0]) {
+        Err(error) => Some(error.to_string()),
+        Ok(_) => None,
+    };
+    assert!(
+        failure
+            .as_deref()
+            .is_some_and(|message| message.contains("max_sampled_textures_per_shader_stage")),
+        "a field count above the device limit must be named, got: {failure:?}"
     );
 }
 
@@ -1876,6 +2375,54 @@ fn scenes_sharing_a_body_but_not_data_still_switch(cx: &mut TestAppContext) {
             "a scene switch must reset the zoom to the fitted floor"
         );
     });
+}
+
+/// A repaint that lands no fresh frame must still paint the last presented
+/// one: the window's display list is rebuilt on every repaint, so a repaint
+/// that paints nothing blanks the canvas — the theme background shows
+/// through, and the scene appears to "go white" the moment the mouse leaves
+/// the window or focus moves away.
+#[test]
+fn a_repaint_without_a_fresh_frame_repaints_the_stored_frame() {
+    use crate::canvas::painted_frame;
+    use crate::canvas::presentation::Presentation;
+    use gpui::RenderImage;
+    use image::{Frame, RgbaImage};
+    use smallvec::SmallVec;
+    use std::sync::Arc;
+
+    let image = Arc::new(RenderImage::new(SmallVec::from_elem(
+        Frame::new(RgbaImage::new(4, 4)),
+        1,
+    )));
+    let stored = Some(image.clone());
+
+    // A fresh frame paints itself.
+    let outcome = Presentation::Painted {
+        image: image.clone(),
+        previous: None,
+    };
+    assert_eq!(
+        painted_frame(&outcome, &None),
+        Some(image.clone()),
+        "a fresh frame must be painted"
+    );
+
+    // A bare repaint — a hover transition, focus loss, a screenshot overlay
+    // taking the mouse — must re-present the stored frame, not blank.
+    assert_eq!(
+        painted_frame(&Presentation::Pending, &stored),
+        Some(image.clone()),
+        "a pending repaint must keep showing the last presented frame"
+    );
+    assert_eq!(
+        painted_frame(&Presentation::Idle, &stored),
+        Some(image),
+        "an idle repaint (e.g. a compile error) must keep the last good frame"
+    );
+
+    // Nothing stored and nothing fresh: nothing to paint.
+    assert_eq!(painted_frame(&Presentation::Pending, &None), None);
 }
 
 /// The uniform block's view slots: `view_center` occupies the former pad

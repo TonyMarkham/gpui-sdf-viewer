@@ -11,11 +11,11 @@ use crate::renderer::{FrameRequest, Renderer};
 use gpui::{
     AnyElement, App, Bounds, Corners, Element, ElementId, Entity, GlobalElementId,
     InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, Size,
-    Styled as _, Window, div, px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollWheelEvent,
+    Size, Styled as _, Window, div, px,
 };
 use soul_attributes::soul;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 /// Exponential smoothing factor for the FPS estimate of presented frames.
 const FPS_EMA_FACTOR: f32 = 0.9;
@@ -290,23 +290,16 @@ impl Canvas {
             }
         });
 
+        let image = painted_frame(&outcome, &self.state.read(cx).frame);
+        if let Some(image) = image {
+            let _ = window.paint_image(bounds, bounds, Corners::all(px(0.0)), image, 0, false);
+        }
         if let Presentation::Painted {
-            ref image,
-            ref previous,
+            previous: Some(previous),
             ..
         } = outcome
         {
-            let _ = window.paint_image(
-                bounds,
-                bounds,
-                Corners::all(px(0.0)),
-                image.clone(),
-                0,
-                false,
-            );
-            if let Some(previous) = previous {
-                let _ = window.drop_image(previous.clone());
-            }
+            let _ = window.drop_image(previous.clone());
         }
 
         // Keep the loop alive while any submitted frame is still outstanding:
@@ -324,6 +317,26 @@ impl Canvas {
 fn physical_edge(css_pixels: f32, scale: f32) -> u32 {
     let edge = (css_pixels * scale).round().max(1.0);
     edge.min(MAX_TEXTURE_EDGE as f32) as u32
+}
+
+/// The image this repaint must carry: the freshly landed frame, or — when no
+/// new frame arrived — the last presented one. The window's display list is
+/// rebuilt on every repaint, so a repaint that paints nothing would blank
+/// the canvas region and the theme background would show through. `stored`
+/// is the element state's last presented frame; on `Painted` it already
+/// equals the fresh image, so the outcome wins, and on `Pending`/`Idle` the
+/// stored frame keeps presenting — compile errors keep the last good frame,
+/// per the scene contract.
+/// through, and the scene appears to "go white" the moment the mouse leaves
+/// the window or focus moves away.
+pub(crate) fn painted_frame(
+    outcome: &Presentation,
+    stored: &Option<Arc<RenderImage>>,
+) -> Option<Arc<RenderImage>> {
+    match outcome {
+        Presentation::Painted { image, .. } => Some(image.clone()),
+        Presentation::Pending | Presentation::Idle => stored.clone(),
+    }
 }
 
 /// The cursor position as a viewport fraction (the base field-uv mapping of

@@ -365,7 +365,7 @@ mod tests {
     use crate::{
         Config, Export as SdfExport, ExportManifest, FieldMap, OfflineError, OfflineResult,
         TileKind, TilePayload,
-        config::{Extract, Paths},
+        config::{Composite, Extract, Paths},
         config::{export::Export as ExportConfig, sdf::Sdf},
         field::grid,
         utilities::sha256_hex,
@@ -818,6 +818,7 @@ mod tests {
                     extra: BTreeMap::new(),
                 },
             },
+            composite: Composite { layers: Vec::new() },
         }
     }
 

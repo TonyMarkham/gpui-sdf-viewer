@@ -1,6 +1,6 @@
 use crate::{
-    constants::{CONTOUR_BAND_DEFAULT, CONTOUR_BAND_MAX},
-    state::{offline::OfflineState, scene::SceneLibrary},
+    constants::{CONTOUR_BAND_DEFAULT, CONTOUR_BAND_MAX, NAVIGATION_COMPOSITE_HEADER},
+    state::{offline::OfflineState, scene::CompositeSpec, scene::SceneLibrary},
 };
 use gpui_component::slider::{SliderEvent, SliderState};
 use sdf_component::SdfCanvasState;
@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------------------------- //
 
 /// Top-level application state: the offline config/status, the scene library,
-/// the active scene, the data-scene controls, and the SDF canvas the root
-/// view renders.
+/// the synthetic composite spec, the active scene, the data-scene controls,
+/// and the SDF canvas the root view renders.
 pub struct App {
     offline: Entity<OfflineState>,
     library: SceneLibrary,
+    composite: Option<CompositeSpec>,
     scenes_dir: Option<PathBuf>,
     active: Option<usize>,
     active_name: Option<String>,
@@ -44,6 +45,7 @@ impl App {
             Some(directory) => SceneLibrary::discover_in(directory),
             None => SceneLibrary::discover(),
         };
+        let composite = CompositeSpec::from_layers(offline.read(cx).composite_layers());
         let canvas = cx.new(SdfCanvasState::new);
         let level_slider = cx.new(|_| {
             SliderState::new()
@@ -67,6 +69,7 @@ impl App {
         let mut state = Self {
             offline,
             library,
+            composite,
             scenes_dir: scenes_dir.map(Path::to_path_buf),
             active: None,
             active_name: None,
@@ -83,7 +86,9 @@ impl App {
         if state.offline.read(cx).needs_setup() {
             return state;
         }
-        if state.library.len() > 0 {
+        if state.library.len() > 0 || state.composite.is_some() {
+            // The first file scene is the startup selection; with no file
+            // scenes at all, the composite is the config-driven default view.
             state.active = Some(0);
         }
         state.load_active(cx);
@@ -119,13 +124,24 @@ impl App {
         self.offline.read(cx).needs_setup()
     }
 
-    /// Names of all discoverable scenes, in display order.
+    /// Names of all discoverable scenes, in display order: the file scenes
+    /// alphabetically, then the synthetic Composite entry when configured.
     pub fn scene_names(&self) -> Vec<String> {
-        self.library
+        let mut names: Vec<String> = self
+            .library
             .entries()
             .iter()
             .map(|entry| entry.name.clone())
-            .collect()
+            .collect();
+        if self.composite.is_some() {
+            names.push(String::from(NAVIGATION_COMPOSITE_HEADER));
+        }
+        names
+    }
+
+    /// Whether the synthetic composite entry is on the list.
+    pub fn has_composite(&self) -> bool {
+        self.composite.is_some()
     }
 
     /// Index of the active scene, if one is selected.
@@ -139,12 +155,14 @@ impl App {
     }
 
     /// Selects and loads the scene at `index`; no-op when out of range or
-    /// already active.
+    /// already active. The index past the last file scene is the composite
+    /// slot, valid only when the spec is non-empty.
     pub fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.active == Some(index) {
             return;
         }
-        if index >= self.library.len() {
+        let composite_slot = self.composite.is_some() && index == self.library.len();
+        if index >= self.library.len() && !composite_slot {
             return;
         }
         self.active = Some(index);
@@ -206,7 +224,10 @@ impl App {
                 Some(directory) => SceneLibrary::discover_in(directory),
                 None => SceneLibrary::discover(),
             };
-            self.active = if self.library.len() > 0 {
+            // Config does not change mid-run; re-deriving here is for
+            // symmetry with the library re-discovery.
+            self.composite = CompositeSpec::from_layers(self.offline.read(cx).composite_layers());
+            self.active = if self.library.len() > 0 || self.composite.is_some() {
                 Some(0)
             } else {
                 None
@@ -225,9 +246,37 @@ impl App {
             return;
         };
 
+        if self.composite.is_some() && active == self.library.len() {
+            self.load_composite(cx);
+            return;
+        }
+
         match self.offline.read(cx).data_dir() {
             Err(error) => self.load_error = Some(error.to_string()),
             Ok(data_dir) => match self.library.load(active, &data_dir) {
+                Ok(scene) => {
+                    self.active_name = Some(String::from(scene.name()));
+                    self.canvas
+                        .update(cx, |canvas, cx| canvas.set_scene(scene, cx));
+                }
+                Err(error) => {
+                    self.load_error = Some(error.to_string());
+                }
+            },
+        }
+    }
+
+    /// Loads the synthetic composite: assembles the scene source from the
+    /// config's layer stack, stages it through the `config:` rewrite path,
+    /// and parses it. Load failures surface in `load_error`/status bar
+    /// exactly like scene loads.
+    fn load_composite(&mut self, cx: &mut Context<Self>) {
+        let Some(spec) = self.composite.clone() else {
+            return;
+        };
+        match self.offline.read(cx).data_dir() {
+            Err(error) => self.load_error = Some(error.to_string()),
+            Ok(data_dir) => match spec.stage(&data_dir) {
                 Ok(scene) => {
                     self.active_name = Some(String::from(scene.name()));
                     self.canvas

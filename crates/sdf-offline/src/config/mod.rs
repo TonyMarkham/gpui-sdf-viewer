@@ -1,3 +1,4 @@
+pub mod composite;
 pub mod export;
 pub mod extract;
 pub mod paths;
@@ -7,6 +8,7 @@ pub mod sdf;
 // ---------------------------------------------------------------------------------------------- //
 
 pub use crate::config::{
+    composite::BandKind, composite::Composite, composite::CompositeBand, composite::CompositeLayer,
     export::Export, extract::Extract, paths::Paths, resolved::ResolvedPaths, sdf::Sdf,
 };
 
@@ -19,6 +21,7 @@ use crate::{
 };
 
 use serde::Deserialize;
+use soul_attributes::soul;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, value};
 
@@ -62,6 +65,44 @@ manifest = "manifest.json"
 [sdf.export.extra]       # fields without a recipe scene, exported under a name
 road_wagon  = "cd_worldmap_road_wagon_sdf"
 blur_height = "cd_worldmap_blur_height"
+
+[composite]              # the composite view: layers stacked bottom-to-top
+# list order = paint order. Every layer: a route name and its bands;
+# every band: low, high, kind, ink, weight. kind is "band" (hard window,
+# full ink inside) or "ramp" (soft smoothstep rising from low to high,
+# staying at full above).
+
+[[composite.layer]]      # water: the deep sea, then the shelf up to the shore
+name = "river"
+bands = [
+    { low = 0.0,   high = 32.0,  kind = "band", ink = [0.220, 0.360, 0.450], weight = 1.0 },
+    { low = 32.0,  high = 122.0, kind = "band", ink = [0.290, 0.450, 0.550], weight = 1.0 },
+]
+
+[[composite.layer]]      # the shoreline edge: the transition strip only
+name = "coast"
+bands = [
+    { low = 122.0, high = 132.0, kind = "band", ink = [0.230, 0.330, 0.400], weight = 0.55 },
+]
+
+[[composite.layer]]
+name = "road"
+bands = [
+    { low = 116.0, high = 136.0, kind = "ramp", ink = [0.420, 0.360, 0.280], weight = 0.8 },
+]
+
+[[composite.layer]]
+name = "mountain"
+bands = [
+    { low = 96.0,  high = 118.0, kind = "ramp", ink = [0.480, 0.500, 0.460], weight = 0.12 },
+    { low = 120.0, high = 130.0, kind = "ramp", ink = [0.440, 0.460, 0.420], weight = 0.30 },
+]
+
+[[composite.layer]]      # a route without an authored recipe: write its band out
+name = "road_wagon"
+bands = [
+    { low = 120.0, high = 136.0, kind = "band", ink = [0.500, 0.500, 0.500], weight = 0.6 },
+]
 "#;
 
 const PATHS_TABLE: &str = "paths";
@@ -80,6 +121,8 @@ pub struct Config {
     pub extract: Extract,
     #[serde(default)]
     pub sdf: Sdf,
+    #[serde(default)]
+    pub composite: Composite,
 }
 
 impl Config {
@@ -191,8 +234,9 @@ impl Config {
     }
 
     /// Hard configuration errors before any I/O: empty includes, a route
-    /// prefix no include pattern covers, and `[sdf.export.extra]` names
-    /// colliding with `[sdf.tiles]` keys.
+    /// prefix no include pattern covers, `[sdf.export.extra]` names colliding
+    /// with `[sdf.tiles]` keys, and a composite layer list naming anything
+    /// but export routes — each route once.
     pub fn check(&self) -> OfflineResult<()> {
         if self.extract.includes.is_empty() {
             return Err(OfflineError::toml(
@@ -218,6 +262,68 @@ impl Config {
                 return Err(OfflineError::toml(format!(
                     "`[sdf.export.extra]` name `{name}` collides with a `[sdf.tiles]` key"
                 )));
+            }
+        }
+
+        self.check_composite()
+    }
+
+    /// The composite layer list: every layer must name an export route and
+    /// none may repeat, and every band must carry sane numbers; an empty
+    /// layer list is valid (the composite is off).
+    #[soul(id = "concept.sdf-scene-contract", step = "composite route validation")]
+    fn check_composite(&self) -> OfflineResult<()> {
+        for (index, layer) in self.composite.layers.iter().enumerate() {
+            if !self.routes().iter().any(|(name, _)| name == &layer.name) {
+                return Err(OfflineError::toml(format!(
+                    "composite layer \"{}\" is not an export route",
+                    layer.name
+                )));
+            }
+            if self.composite.layers[..index]
+                .iter()
+                .any(|other| other.name == layer.name)
+            {
+                return Err(OfflineError::toml(format!(
+                    "composite layer \"{}\" is listed twice",
+                    layer.name
+                )));
+            }
+            if layer.bands.is_empty() {
+                return Err(OfflineError::toml(format!(
+                    "composite layer \"{}\" carries no bands",
+                    layer.name
+                )));
+            }
+            for band in &layer.bands {
+                for (name, value) in [("low", band.low), ("high", band.high)] {
+                    if !(0.0..=255.0).contains(&value) {
+                        return Err(OfflineError::toml(format!(
+                            "composite layer \"{}\": band {} {} is outside 0..=255",
+                            layer.name, name, value
+                        )));
+                    }
+                }
+                if band.low > band.high {
+                    return Err(OfflineError::toml(format!(
+                        "composite layer \"{}\": band low {} is above high {}",
+                        layer.name, band.low, band.high
+                    )));
+                }
+                if !(0.0..=1.0).contains(&band.weight) {
+                    return Err(OfflineError::toml(format!(
+                        "composite layer \"{}\": band weight {} is outside 0..=1",
+                        layer.name, band.weight
+                    )));
+                }
+                for (index, component) in band.ink.iter().enumerate() {
+                    if !(0.0..=1.0).contains(component) {
+                        return Err(OfflineError::toml(format!(
+                            "composite layer \"{}\": band ink component {index} {} is outside 0..=1",
+                            layer.name, component
+                        )));
+                    }
+                }
             }
         }
 

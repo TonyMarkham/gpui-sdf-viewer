@@ -5,6 +5,7 @@ use super::{
 };
 use crate::state::offline::OfflineState;
 use crate::{RootView, state::app::App};
+use sdf_offline::config::CompositeLayer;
 use std::path::PathBuf;
 
 use super::app_host::AppHost;
@@ -62,6 +63,17 @@ impl AppFixture {
         let mut config = sdf_offline::Config::defaults();
         config.paths.game_root = self.root.join(TEST_INSTALL_DIR).display().to_string();
         config.paths.data_dir = self.root.join(TEST_WORK_DIR).display().to_string();
+        OfflineState::from_config(config)
+    }
+
+    /// Like [`Self::offline`] with the composite layer stack replaced — the
+    /// windowless composite tests bind these to the fixture manifest's own
+    /// layers.
+    pub(crate) fn offline_with_composite(&self, layers: Vec<CompositeLayer>) -> OfflineState {
+        let mut config = sdf_offline::Config::defaults();
+        config.paths.game_root = self.root.join(TEST_INSTALL_DIR).display().to_string();
+        config.paths.data_dir = self.root.join(TEST_WORK_DIR).display().to_string();
+        config.composite.layers = layers;
         OfflineState::from_config(config)
     }
 }

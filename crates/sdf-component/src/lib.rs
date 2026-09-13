@@ -22,7 +22,7 @@ pub use crate::{
     canvas::{
         Canvas as SdfCanvas, presentation::Presentation, sdf_canvas, state::State as SdfCanvasState,
     },
-    data::{level::Level, scene_data::SceneData, scene_tile::SceneTile},
+    data::{level::Level, scene_data::SceneData, scene_data::SceneField, scene_tile::SceneTile},
     error::{Error as SdfError, result::Result as SdfResult},
     scene::SdfScene,
 };

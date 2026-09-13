@@ -6,7 +6,7 @@ mod target;
 pub(crate) use frame_request::FrameRequest;
 
 use self::{staging::Staging, staging_state::StagingState, target::Target};
-use crate::{SceneData, SdfError, SdfResult, overlay, scene::SdfScene};
+use crate::{SceneData, SceneField, SdfError, SdfResult, overlay, scene::SdfScene};
 
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
@@ -60,6 +60,57 @@ const PARK_POLL_LIMIT: usize = 100;
 #[cfg(test)]
 const PARK_POLL_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// The bind-group layout entries for `field_count` fields: the uniform
+/// block, one texture binding per field (field 0 at binding 1; fields 1..n
+/// at bindings 4, 5, …), and the two samplers.
+fn bind_group_layout_entries(field_count: usize) -> Vec<BindGroupLayoutEntry> {
+    let texture = BindGroupLayoutEntry {
+        binding: 0,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Texture {
+            sample_type: TextureSampleType::Float { filterable: true },
+            view_dimension: TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let mut entries = vec![
+        BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
+            },
+            count: None,
+        },
+        BindGroupLayoutEntry {
+            binding: 1,
+            ..texture
+        },
+        BindGroupLayoutEntry {
+            binding: 2,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+        BindGroupLayoutEntry {
+            binding: 3,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+            count: None,
+        },
+    ];
+    for index in 1..field_count {
+        entries.push(BindGroupLayoutEntry {
+            binding: 3 + index as u32,
+            ..texture
+        });
+    }
+    entries
+}
+
 /// A wgpu render-to-texture pipeline for SDF scenes with a ring of staging
 /// buffers for non-blocking CPU readback.
 pub(crate) struct Renderer {
@@ -71,8 +122,13 @@ pub(crate) struct Renderer {
     nearest_sampler: Sampler,
     stub_view: TextureView,
     bind_group: BindGroup,
-    field: Option<Texture>,
+    fields: Vec<Texture>,
     field_key: Option<String>,
+    /// The number of field textures the current bind-group layout was built
+    /// for. A scene whose field count differs forces a rebuild of the
+    /// layout, the pipeline layout, and both pipelines (composite → single →
+    /// composite rides the same rebuild).
+    layout_field_count: usize,
     /// The data key whose last upload attempt failed, with the error to keep
     /// raising. A failed upload is deterministic — a payload stays missing,
     /// corrupt, or truncated until the scene's data changes — so re-attempting
@@ -138,40 +194,7 @@ impl Renderer {
 
         let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("sdf-bind-group-layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
+            entries: &bind_group_layout_entries(1),
         });
 
         let uniform_buffer = device.create_buffer(&BufferDescriptor {
@@ -261,8 +284,9 @@ impl Renderer {
             nearest_sampler,
             stub_view,
             bind_group,
-            field: None,
+            fields: Vec::new(),
             field_key: None,
+            layout_field_count: 1,
             field_failure: None,
             overlay_pipeline: None,
             overlay_source: None,
@@ -340,10 +364,12 @@ impl Renderer {
         self.build_presentable_frame(request.width, request.height)
     }
 
-    /// Aligns the bound field texture with the scene's data: uploads the
-    /// layer's tiles when the data identity changed, or rebinds the inert
-    /// 1×1 stub when the scene carries none. A failed upload is recorded and
-    /// re-raised on subsequent paints without re-reading the payloads.
+    /// Aligns the bound field textures with the scene's data: uploads every
+    /// configured field's tiles when the data identity changed (one texture,
+    /// one bind-group entry per field), or rebinds the inert 1×1 stub when
+    /// the scene carries none. A field count the current layout does not
+    /// carry first rebuilds the bind-group shape. A failed upload is recorded
+    /// and re-raised on subsequent paints without re-reading the payloads.
     #[soul(id = "concept.sdf-scene-contract", step = "field texture + upload")]
     fn ensure_field(&mut self, scene: &SdfScene) -> SdfResult<()> {
         let key = scene.data_key();
@@ -359,32 +385,66 @@ impl Renderer {
             return Ok(());
         }
 
-        match scene.data() {
+        let data = scene.data();
+        let field_count = data.map_or(1, |data| data.fields.len());
+
+        // A field count beyond the device's sampled-texture budget is a
+        // named error, never truncation — checked before any layout is
+        // rebuilt, so the failure is cacheable and no oversized layout is
+        // ever created.
+        if let Some(data) = data {
+            let limit = self.device.limits().max_sampled_textures_per_shader_stage;
+            if data.fields.len() > limit as usize {
+                let message = format!(
+                    "the composite needs {} field textures, exceeding the device limit max_sampled_textures_per_shader_stage = {limit}",
+                    data.fields.len()
+                );
+                if let Some(key) = key {
+                    self.field_failure = Some((key, message.clone()));
+                }
+                return Err(SdfError::data(&message));
+            }
+        }
+
+        if field_count != self.layout_field_count {
+            self.rebuild_bind_group_shape(field_count);
+        }
+
+        match data {
             Some(data) => {
-                let texture = match self.create_field_texture(data) {
-                    Ok(texture) => texture,
-                    Err(error) => {
-                        let message = match &error {
-                            SdfError::Data { message, .. } => String::from(message),
-                            other => other.to_string(),
-                        };
-                        if let Some(key) = key {
-                            self.field_failure = Some((key, message.clone()));
+                let mut textures = Vec::with_capacity(data.fields.len());
+                for field in &data.fields {
+                    let texture = match self.create_field_texture(data, field) {
+                        Ok(texture) => texture,
+                        Err(error) => {
+                            let message = match &error {
+                                SdfError::Data { message, .. } => String::from(message),
+                                other => other.to_string(),
+                            };
+                            if let Some(key) = key {
+                                self.field_failure = Some((key, message.clone()));
+                            }
+                            return Err(SdfError::data(&message));
                         }
-                        return Err(SdfError::data(&message));
-                    }
-                };
-                let view = texture.create_view(&TextureViewDescriptor {
-                    dimension: Some(TextureViewDimension::D2Array),
-                    ..Default::default()
-                });
-                self.bind_field(&view);
-                self.field = Some(texture);
+                    };
+                    textures.push(texture);
+                }
+                let views: Vec<TextureView> = textures
+                    .iter()
+                    .map(|texture| {
+                        texture.create_view(&TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D2Array),
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                self.bind_fields(&views);
+                self.fields = textures;
             }
             None => {
-                let view = self.stub_view.clone();
-                self.bind_field(&view);
-                self.field = None;
+                let stub = self.stub_view.clone();
+                self.bind_fields(&[stub]);
+                self.fields = Vec::new();
             }
         }
         self.field_key = key;
@@ -392,53 +452,82 @@ impl Renderer {
         Ok(())
     }
 
-    /// Rebuilds the bind group around `view`; the samplers and uniform
-    /// binding are carried over unchanged.
-    fn bind_field(&mut self, view: &TextureView) {
+    /// Rebuilds the bind-group shape for `field_count` fields: one texture
+    /// entry per field (field 0 keeps binding 1; fields 1..n take bindings
+    /// 4, 5, …), the pipeline layout rebuilt against it, and both pipeline
+    /// sources invalidated — the overlay pipeline shares the layout, so
+    /// source equality alone must not skip its recompile.
+    fn rebuild_bind_group_shape(&mut self, field_count: usize) {
+        self.bind_group_layout = self
+            .device
+            .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("sdf-bind-group-layout"),
+                entries: &bind_group_layout_entries(field_count),
+            });
+        self.pipeline_layout = self
+            .device
+            .create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("sdf-pipeline-layout"),
+                bind_group_layouts: &[Some(&self.bind_group_layout)],
+                immediate_size: 0,
+            });
+        self.layout_field_count = field_count;
+        self.compiled_source = None;
+        self.overlay_source = None;
+    }
+
+    /// Rebuilds the bind group around `views` — one texture entry per field,
+    /// field 0 at binding 1 and fields 1..n at bindings 4, 5, … — carrying
+    /// the uniform block and samplers over unchanged.
+    fn bind_fields(&mut self, views: &[TextureView]) {
+        let mut entries = Vec::with_capacity(views.len() + 3);
+        entries.push(BindGroupEntry {
+            binding: 0,
+            resource: self.uniform_buffer.as_entire_binding(),
+        });
+        for (index, view) in views.iter().enumerate() {
+            entries.push(BindGroupEntry {
+                binding: if index == 0 { 1 } else { 3 + index as u32 },
+                resource: wgpu::BindingResource::TextureView(view),
+            });
+        }
+        entries.push(BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+        });
+        entries.push(BindGroupEntry {
+            binding: 3,
+            resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+        });
         self.bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("sdf-bind-group"),
             layout: &self.bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                },
-            ],
+            entries: &entries,
         });
     }
 
-    /// Creates the field texture array for `data` and uploads every tile:
-    /// read the payload, verify its sha256 against the manifest, check its
-    /// length against the declared mip sizes, then write one texture level
-    /// per mip. Stub tiles carry a constant-fill payload and expand to their
-    /// grid region at every level. Anything above a device limit is rejected
+    /// Creates one field's texture array and uploads every tile: read the
+    /// payload, verify its sha256 against the manifest, check its length
+    /// against the declared mip sizes, then write one texture level per mip.
+    /// Stub tiles carry a constant-fill payload and expand to their grid
+    /// region at every level. Anything above a device limit is rejected
     /// with the limit named, never truncated.
-    fn create_field_texture(&self, data: &SceneData) -> SdfResult<Texture> {
+    #[soul(id = "concept.sdf-scene-contract", step = "composite field upload")]
+    fn create_field_texture(&self, data: &SceneData, field: &SceneField) -> SdfResult<Texture> {
+        let layer = field.layer.as_str();
         let limits = self.device.limits();
         let tile_edge = data.levels[0].size;
         if tile_edge > limits.max_texture_dimension_2d {
             return Err(SdfError::data(&format!(
-                "layer `{}`: tile edge {tile_edge} exceeds the device limit max_texture_dimension_2d = {}",
-                data.layer, limits.max_texture_dimension_2d
+                "layer `{layer}`: tile edge {tile_edge} exceeds the device limit max_texture_dimension_2d = {}",
+                limits.max_texture_dimension_2d
             )));
         }
         let layers = u64::from(data.grid) * u64::from(data.grid);
         if layers > u64::from(limits.max_texture_array_layers) {
             return Err(SdfError::data(&format!(
-                "layer `{}`: the {}×{} tile grid needs {layers} texture array layers, exceeding the device limit max_texture_array_layers = {}",
-                data.layer, data.grid, data.grid, limits.max_texture_array_layers
+                "layer `{layer}`: the {}×{} tile grid needs {layers} texture array layers, exceeding the device limit max_texture_array_layers = {}",
+                data.grid, data.grid, limits.max_texture_array_layers
             )));
         }
         let layers = layers as u32;
@@ -446,8 +535,7 @@ impl Renderer {
         let max_levels = tile_edge.ilog2() + 1;
         if level_count > max_levels {
             return Err(SdfError::data(&format!(
-                "layer `{}`: the manifest declares {level_count} mip levels for a {tile_edge}² tile, which supports at most {max_levels}",
-                data.layer
+                "layer `{layer}`: the manifest declares {level_count} mip levels for a {tile_edge}² tile, which supports at most {max_levels}",
             )));
         }
 
@@ -469,16 +557,14 @@ impl Renderer {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         if let Some(error) = pollster::block_on(guard.pop()) {
             return Err(SdfError::data(&format!(
-                "layer `{}`: field texture creation failed: {error}",
-                data.layer
+                "layer `{layer}`: field texture creation failed: {error}",
             )));
         }
 
-        for tile in &data.tiles {
+        for tile in &field.tiles {
             let payload = std::fs::read(&tile.payload).map_err(|error| {
                 SdfError::data(&format!(
-                    "layer `{}`: tile `{}` at ({}, {}): payload could not be read: {error}",
-                    data.layer,
+                    "layer `{layer}`: tile `{}` at ({}, {}): payload could not be read: {error}",
                     tile.payload.display(),
                     tile.x,
                     tile.y
@@ -488,8 +574,7 @@ impl Renderer {
             let actual = sha256_hex(&payload);
             if !actual.eq_ignore_ascii_case(&tile.sha256) {
                 return Err(SdfError::data(&format!(
-                    "layer `{}`: tile `{}` at ({}, {}): payload sha256 {actual} does not match the manifest's {}",
-                    data.layer,
+                    "layer `{layer}`: tile `{}` at ({}, {}): payload sha256 {actual} does not match the manifest's {}",
                     tile.payload.display(),
                     tile.x,
                     tile.y,
@@ -500,8 +585,7 @@ impl Renderer {
             if tile.stub {
                 let Some(constant) = payload.first() else {
                     return Err(SdfError::data(&format!(
-                        "layer `{}`: tile `{}` at ({}, {}): stub payload is empty",
-                        data.layer,
+                        "layer `{layer}`: tile `{}` at ({}, {}): stub payload is empty",
                         tile.payload.display(),
                         tile.x,
                         tile.y
@@ -509,8 +593,7 @@ impl Renderer {
                 };
                 if payload.iter().any(|byte| byte != constant) {
                     return Err(SdfError::data(&format!(
-                        "layer `{}`: tile `{}` at ({}, {}): stub payload is not constant-fill",
-                        data.layer,
+                        "layer `{layer}`: tile `{}` at ({}, {}): stub payload is not constant-fill",
                         tile.payload.display(),
                         tile.x,
                         tile.y
@@ -530,8 +613,7 @@ impl Renderer {
                 let expected = data.tile_payload_len();
                 if payload.len() as u64 != expected {
                     return Err(SdfError::data(&format!(
-                        "layer `{}`: tile `{}` at ({}, {}): payload is {} bytes, the manifest's mip table declares {expected}",
-                        data.layer,
+                        "layer `{layer}`: tile `{}` at ({}, {}): payload is {} bytes, the manifest's mip table declares {expected}",
                         tile.payload.display(),
                         tile.x,
                         tile.y,
@@ -543,8 +625,7 @@ impl Renderer {
                     let end = offset + level.bytes as usize;
                     let Some(level_bytes) = payload.get(offset..end) else {
                         return Err(SdfError::data(&format!(
-                            "layer `{}`: tile `{}` at ({}, {}): payload ends before mip level {index}",
-                            data.layer,
+                            "layer `{layer}`: tile `{}` at ({}, {}): payload ends before mip level {index}",
                             tile.payload.display(),
                             tile.x,
                             tile.y
