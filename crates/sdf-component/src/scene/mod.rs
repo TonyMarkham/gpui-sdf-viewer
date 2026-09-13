@@ -56,9 +56,9 @@ use std::path::Path;
 /// presentation.
 ///
 /// The prelude reserves the names `u`, `sd_*`, `op_*`, `rot`, `field`,
-/// `field_lod`, `field_raw`, `field_coord`, `field_uv`, `FieldCoord`,
-/// `t_field`, `s_field`, `s_field_nearest`, and `FIELD_*` for its helpers;
-/// scenes must not define them.
+/// `field_lod`, `field_raw`, `field_coord`, `field_uv`, `view_p`,
+/// `FieldCoord`, `t_field`, `s_field`, `s_field_nearest`, and `FIELD_*` for
+/// its helpers; scenes must not define them.
 #[derive(Clone, Debug)]
 pub struct SdfScene {
     name: String,
@@ -218,11 +218,17 @@ const RENDER_ENTRY: &str = "fn render(";
 /// both scene classes: data scenes bind the field texture array, scenes
 /// without data bind a 1×1 zero-filled stand-in so the field helpers stay
 /// inert.
+///
+/// `view_center` (bytes 24..32) is the field-uv point at the viewport center
+/// and `params.z` (bytes 40..44) the zoom factor; together they are the
+/// pan/zoom view every field helper sees (default: `[0.5, 0.5]` and `1.0`,
+/// the fitted full-field view). `params.w` is reserved.
 pub(crate) const UNIFORM_BINDINGS: &str = r#"struct Uniforms {
     resolution: vec2f,
     time: f32,
     aspect: f32,
     mouse: vec2f,
+    view_center: vec2f,
     params: vec4f,
 };
 
@@ -236,14 +242,16 @@ pub(crate) const UNIFORM_BINDINGS: &str = r#"struct Uniforms {
 /// the tile-grid edge (1 for the inert no-data binding) and `levels` the mip
 /// chain length.
 ///
-/// `field_uv` maps canvas coordinates onto the field; `FIELD_V_FLIP` selects
-/// the vertical orientation. Calibrated against the map pipeline's crops:
+/// `field_uv` maps canvas coordinates onto the field and applies the pan/zoom
+/// view carried by `u.view_center`/`u.params.z`; `view_p` expresses the same
+/// view back in the canvas `p` convention. `FIELD_V_FLIP` selects the vertical
+/// orientation. Calibrated against the map pipeline's crops:
 /// the map repo's crop writer slices its rows from field row 0 upward
 /// (crop top-left = field coords (6016, 3072) for Hernand bay), and this
 /// prelude with `FIELD_V_FLIP = 1.0` puts field row 0 at the canvas top —
 /// both images orient field rows top-down, so the GUI presents the crops
-/// unmirrored. Mirrored output would flip this one constant, here and
-/// nowhere else.
+/// unmirrored. Mirrored output would flip this constant and `view_p`'s
+/// hardcoded y expression below — here and nowhere else.
 pub(crate) fn field_helpers(grid: u32, levels: u32) -> String {
     let header =
         format!("const FIELD_TILES: u32 = {grid}u;\nconst FIELD_LEVELS: u32 = {levels}u;\n");
@@ -263,7 +271,14 @@ fn field_uv(p: vec2f) -> vec2f {
     let x = (p.x / u.aspect + 1.0) * 0.5;
     let up = (p.y + 1.0) * 0.5;
     let y = mix(up, 1.0 - up, FIELD_V_FLIP);
-    return clamp(vec2f(x, y), vec2f(0.0), vec2f(1.0 - 1e-6));
+    let base = clamp(vec2f(x, y), vec2f(0.0), vec2f(1.0 - 1e-6));
+    let viewed = (base - vec2f(0.5)) / u.params.z + u.view_center;
+    return clamp(viewed, vec2f(0.0), vec2f(1.0 - 1e-6));
+}
+
+fn view_p(p: vec2f) -> vec2f {
+    let uv = field_uv(p);
+    return vec2f((uv.x * 2.0 - 1.0) * u.aspect, 1.0 - uv.y * 2.0);
 }
 
 fn field_coord(p: vec2f) -> FieldCoord {

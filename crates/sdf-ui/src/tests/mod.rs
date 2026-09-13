@@ -1,4 +1,7 @@
-use gpui::{Entity, Modifiers, Point, Size, TestAppContext, VisualTestContext, px};
+use gpui::{
+    Entity, Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, Size, TestAppContext,
+    TouchPhase, VisualTestContext, px,
+};
 use gpui_component::ActiveTheme as _;
 use gpui_component::slider::{SliderEvent, SliderValue};
 use serde_json::json;
@@ -101,6 +104,15 @@ fn the_first_run_flow_renders_setup_then_the_shell(cx: &mut TestAppContext) {
     let fixture = fixture("flow", cx);
     write_file(&fixture.scenes.join("probe_a.wgsl"), TEST_SCENE_A);
     write_file(&fixture.scenes.join("probe_b.wgsl"), TEST_SCENE_B);
+    // Discovered at the post-extraction refresh; loads once the config
+    // manifest exists (written below, before the shell comes up). The view
+    // assertions select it (last alphabetically, so the fixture's scene
+    // indices above stay stable) because only a data scene's canvas takes
+    // the wheel and the drag.
+    write_file(
+        &fixture.scenes.join("zz_config_probe.wgsl"),
+        TEST_DATA_SCENE,
+    );
     let work = fixture.root.join(TEST_WORK_DIR);
     let manifest = work.join("sdf").join("manifest.json");
     let removed = std::fs::remove_file(&manifest);
@@ -249,6 +261,276 @@ fn the_first_run_flow_renders_setup_then_the_shell(cx: &mut TestAppContext) {
     redraw(cx);
     let host = bounds(cx, "canvas-host");
     assert!(host.is_some(), "the canvas survives a resize");
+
+    // The map view, driven through the canvas element's real input handlers:
+    // wheel zooms about the cursor, left-drag pans, the 1:1 control resets,
+    // and a scene switch re-fits. The control bar's zoom readout tracks the
+    // canvas state.
+    redraw(cx);
+    let bar = crate::component::capture::control_bar_lines();
+    assert!(
+        bar.iter().any(|line| line == "1.0×"),
+        "the control bar must read the fitted view as 1.0×, got: {bar:?}"
+    );
+    assert!(
+        bar.iter().any(|line| line.contains("1:1 disabled")),
+        "the 1:1 control must be disabled while the scene carries no data, got: {bar:?}"
+    );
+
+    // The has_data policy through the real handlers: on a non-data scene the
+    // wheel and a left-drag must leave the map view alone, so the zoom
+    // readout cannot move while the 1:1 control stays disabled. The view is
+    // zoomed through the public mutator first — the wheel itself is under
+    // test, and at the identity view a drag pans nothing (the clamp forces
+    // exact identity at the zoom floor), so only a zoomed view makes a
+    // deleted gate observable.
+    cx.update(|_, cx| {
+        state.update(cx, |state, cx| {
+            state
+                .canvas()
+                .update(cx, |canvas, cx| canvas.zoom_at([0.75, 0.75], 4.0, cx));
+        });
+    });
+    let (zoomed_center, zoomed_zoom) = cx.update(|_, cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (canvas.view_center(), canvas.view_zoom())
+    });
+    let Some(gate_bounds) = bounds(cx, "sdf-canvas-root") else {
+        unreachable!("the canvas renders in the shell");
+    };
+    let gate_center = Point::new(
+        gate_bounds.origin.x + gate_bounds.size.width / 2.0,
+        gate_bounds.origin.y + gate_bounds.size.height / 2.0,
+    );
+    cx.simulate_event(ScrollWheelEvent {
+        position: gate_center,
+        delta: ScrollDelta::Lines(Point { x: 0.0, y: 3.0 }),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    let zoom_after_wheel = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_zoom());
+    assert_eq!(
+        zoom_after_wheel, zoomed_zoom,
+        "a wheel event on a non-data scene must not zoom, got {zoom_after_wheel}"
+    );
+    cx.simulate_mouse_down(gate_center, MouseButton::Left, Modifiers::none());
+    let gate_dragged = Point::new(gate_center.x + px(24.0), gate_center.y);
+    cx.simulate_mouse_move(gate_dragged, None, Modifiers::none());
+    let center_after_drag = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_center());
+    assert_eq!(
+        center_after_drag, zoomed_center,
+        "a left-drag on a non-data scene must not pan, got {center_after_drag:?}"
+    );
+    cx.simulate_mouse_up(gate_dragged, MouseButton::Left, Modifiers::none());
+    cx.update(|_, cx| {
+        state.update(cx, |state, cx| {
+            state
+                .canvas()
+                .update(cx, |canvas, cx| canvas.reset_view(cx));
+        });
+    });
+
+    cx.update(|_, cx| {
+        state.update(cx, |state, cx| state.select(2, cx));
+    });
+    redraw(cx);
+    let has_data = cx.update(|_, cx| state.read(cx).canvas().read(cx).has_data());
+    assert!(has_data, "the config scene must load as a data scene");
+    let bar = crate::component::capture::control_bar_lines();
+    assert!(
+        !bar.iter().any(|line| line.contains("disabled")),
+        "the 1:1 control must enable once the scene carries data, got: {bar:?}"
+    );
+
+    let Some(canvas_bounds) = bounds(cx, "sdf-canvas-root") else {
+        unreachable!("the canvas renders in the shell");
+    };
+    let canvas_center = Point::new(
+        canvas_bounds.origin.x + canvas_bounds.size.width / 2.0,
+        canvas_bounds.origin.y + canvas_bounds.size.height / 2.0,
+    );
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: canvas_center,
+        delta: ScrollDelta::Lines(Point { x: 0.0, y: 3.0 }),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    let zoom = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_zoom());
+    assert!(zoom > 1.0, "a wheel-up step must zoom in, got {zoom}");
+    redraw(cx);
+    let bar = crate::component::capture::control_bar_lines();
+    let zoom_label = format!("{zoom:.1}×");
+    assert!(
+        bar.contains(&zoom_label),
+        "the zoom readout must track view_zoom(), got: {bar:?}"
+    );
+
+    cx.simulate_mouse_down(canvas_center, MouseButton::Left, Modifiers::none());
+    let dragged = Point::new(canvas_center.x + px(24.0), canvas_center.y);
+    cx.simulate_mouse_move(dragged, None, Modifiers::none());
+    let center = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_center());
+    assert!(
+        center[0] < 0.5,
+        "dragging right must pull the view center left (content follows the cursor), got {center:?}"
+    );
+    assert!(
+        (center[1] - 0.5).abs() <= 1e-4,
+        "a horizontal drag must not move the y center, got {center:?}"
+    );
+    cx.simulate_mouse_up(dragged, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        Point::new(dragged.x - px(48.0), dragged.y),
+        None,
+        Modifiers::none(),
+    );
+    let center_after_up = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_center());
+    assert_eq!(
+        center_after_up, center,
+        "moving after the mouse-up must not pan"
+    );
+
+    // The bounds-edge policies: moves outside the canvas keep panning while
+    // a drag runs (clamped), and a release outside the canvas still ends it.
+    cx.simulate_mouse_down(canvas_center, MouseButton::Left, Modifiers::none());
+    let Some(bar_bounds) = bounds(cx, "control-bar") else {
+        unreachable!("the control bar renders in the shell");
+    };
+    let outside = Point::new(
+        bar_bounds.origin.x + bar_bounds.size.width / 2.0,
+        bar_bounds.origin.y + bar_bounds.size.height / 2.0,
+    );
+    let fraction_outside = [
+        f32::from(outside.x - canvas_bounds.origin.x) / f32::from(canvas_bounds.size.width),
+        f32::from(outside.y - canvas_bounds.origin.y) / f32::from(canvas_bounds.size.height),
+    ];
+    assert!(
+        !(0.0..=1.0).contains(&fraction_outside[0]) || !(0.0..=1.0).contains(&fraction_outside[1]),
+        "the control bar must sit outside the canvas for this probe, got {fraction_outside:?}"
+    );
+    cx.simulate_mouse_move(outside, None, Modifiers::none());
+    let center_outside = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_center());
+    assert_ne!(
+        center_outside, center,
+        "a move outside the canvas must keep panning while the drag runs, got {center_outside:?}"
+    );
+    cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(canvas_center, None, Modifiers::none());
+    let center_after_outside_up = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_center());
+    assert_eq!(
+        center_after_outside_up, center_outside,
+        "a release outside the canvas must end the drag"
+    );
+
+    let clicked = click_button(cx, crate::constants::CONTROL_VIEW_RESET_BUTTON_ID);
+    assert!(clicked, "the control bar must render the 1:1 control");
+    let (center, zoom) = cx.update(|_, cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (canvas.view_center(), canvas.view_zoom())
+    });
+    assert_eq!(zoom, 1.0, "the 1:1 control must reset the zoom");
+    assert_eq!(center, [0.5, 0.5], "the 1:1 control must reset the center");
+
+    // The zoom-aware LOD derivation through its real call site: the submitted
+    // level must follow both the slider's base bias and the view zoom.
+    cx.update(|_, cx| {
+        state.update(cx, |state, cx| {
+            state
+                .canvas()
+                .update(cx, |canvas, cx| canvas.set_field_level(1.0, cx));
+        });
+    });
+    redraw(cx);
+    let submitted = cx.update(|_, cx| state.read(cx).canvas().read(cx).submitted_field_level());
+    if let Some(level) = submitted {
+        let levels = cx.update(|_, cx| state.read(cx).canvas().read(cx).field_level_count());
+        let max = levels.map_or(0.0, |levels| (levels.max(1) - 1) as f32);
+        assert_eq!(
+            level, max,
+            "the LOD slider at 1.0 must submit the chain's coarsest level"
+        );
+        cx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state
+                    .canvas()
+                    .update(cx, |canvas, cx| canvas.zoom_at([0.75, 0.75], 4.0, cx));
+            });
+        });
+        redraw(cx);
+        let refined = cx.update(|_, cx| state.read(cx).canvas().read(cx).submitted_field_level());
+        let expected = (max - 4.0f32.log2()).round().clamp(0.0, max);
+        assert_eq!(
+            refined,
+            Some(expected),
+            "zooming must refine the submitted level below the slider's bias"
+        );
+    } else {
+        eprintln!("skipping the LOD call-site assertion: the renderer never submitted a frame");
+    }
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: canvas_center,
+        delta: ScrollDelta::Lines(Point { x: 0.0, y: 3.0 }),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    let zoom = cx.update(|_, cx| state.read(cx).canvas().read(cx).view_zoom());
+    assert!(
+        zoom > 1.0,
+        "the second wheel step must zoom in again, got {zoom}"
+    );
+
+    // Resize stability: the view lives in uv fractions, so resizing the
+    // window must not move it.
+    let (center_before, _) = cx.update(|_, cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (canvas.view_center(), canvas.view_zoom())
+    });
+    cx.simulate_mouse_down(canvas_center, MouseButton::Left, Modifiers::none());
+    let panned_to = Point::new(canvas_center.x + px(30.0), canvas_center.y);
+    cx.simulate_mouse_move(panned_to, None, Modifiers::none());
+    let (center, zoom) = cx.update(|_, cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (canvas.view_center(), canvas.view_zoom())
+    });
+    assert_ne!(
+        center, center_before,
+        "the pre-resize drag must move the view, got {center:?}"
+    );
+    cx.simulate_resize(Size {
+        width: px(900.0),
+        height: px(700.0),
+    });
+    redraw(cx);
+    let (center_after, zoom_after) = cx.update(|_, cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (canvas.view_center(), canvas.view_zoom())
+    });
+    assert_eq!(
+        center_after, center,
+        "a window resize must not move the view center"
+    );
+    assert_eq!(zoom_after, zoom, "a window resize must not change the zoom");
+    cx.simulate_mouse_up(panned_to, MouseButton::Left, Modifiers::none());
+
+    cx.update(|_, cx| {
+        state.update(cx, |state, cx| state.select(1, cx));
+    });
+    redraw(cx);
+    let (center, zoom) = cx.update(|_, cx| {
+        let canvas = state.read(cx).canvas().read(cx);
+        (canvas.view_center(), canvas.view_zoom())
+    });
+    assert_eq!(
+        zoom, 1.0,
+        "a scene switch must reset the zoom to the fitted view"
+    );
+    assert_eq!(center, [0.5, 0.5], "a scene switch must reset the center");
+    let bar = crate::component::capture::control_bar_lines();
+    assert!(
+        bar.iter().any(|line| line == "1.0×") && bar.iter().any(|line| line.contains("disabled")),
+        "the no-data scene must read 1.0× with the 1:1 control disabled, got: {bar:?}"
+    );
 
     let reopened = click_button(cx, crate::constants::NAVIGATION_GAME_FOLDER_BUTTON_ID);
     assert!(

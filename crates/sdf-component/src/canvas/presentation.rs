@@ -8,7 +8,6 @@ pub enum Presentation {
     Painted {
         image: Arc<RenderImage>,
         previous: Option<Arc<RenderImage>>,
-        animated: bool,
     },
     /// A submission is in flight; another frame is needed to present it.
     Pending,

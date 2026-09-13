@@ -3,11 +3,15 @@ pub(crate) mod state;
 
 // ---------------------------------------------------------------------------------------------- //
 
-use self::{presentation::Presentation, state::State};
+use self::{
+    presentation::Presentation,
+    state::{State, wheel_zoom_factor},
+};
 use crate::renderer::{FrameRequest, Renderer};
 use gpui::{
     AnyElement, App, Bounds, Corners, Element, ElementId, Entity, GlobalElementId,
-    InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseMoveEvent, Pixels,
+    InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, Size,
     Styled as _, Window, div, px,
 };
 use soul_attributes::soul;
@@ -98,6 +102,7 @@ impl Element for Canvas {
         request_layout.paint(window, cx);
 
         self.track_mouse(bounds, window);
+        self.track_view_input(bounds, window);
         self.render_and_present(bounds, window, cx);
     }
 }
@@ -134,10 +139,81 @@ impl Canvas {
         });
     }
 
+    /// Registers the map view's input handlers alongside `track_mouse`:
+    /// scroll zooms about the cursor, left-drag pans, mouse-up ends the drag.
+    /// Wheel and mouse-down gate on `state.has_data()` so non-data scenes
+    /// leave the wheel alone; the mouse-up handler carries no inside-bounds
+    /// check so releasing outside the canvas still ends the drag, and moves
+    /// outside the bounds keep panning (clamped) while a drag is running.
+    #[soul(id = "interaction.sdf.render-frame", step = "view input")]
+    fn track_view_input(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        let state = self.state.clone();
+        let origin = bounds.origin;
+        let size = bounds.size;
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if !phase.bubble() {
+                return;
+            }
+            let fraction = viewport_fraction(event.position, origin, size);
+            if !inside_viewport(fraction) {
+                return;
+            }
+            let delta_y = f32::from(event.delta.pixel_delta(window.line_height()).y);
+            let factor = wheel_zoom_factor(delta_y);
+            state.update(cx, |state, cx| {
+                if !state.has_data() {
+                    return;
+                }
+                state.zoom_at(fraction, state.view_zoom() * factor, cx);
+            });
+        });
+
+        let state = self.state.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+            if !phase.bubble() {
+                return;
+            }
+            if event.button != MouseButton::Left {
+                return;
+            }
+            let fraction = viewport_fraction(event.position, origin, size);
+            if !inside_viewport(fraction) {
+                return;
+            }
+            state.update(cx, |state, _| {
+                if state.has_data() {
+                    state.begin_drag(fraction);
+                }
+            });
+        });
+
+        let state = self.state.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if !phase.bubble() {
+                return;
+            }
+            let fraction = viewport_fraction(event.position, origin, size);
+            state.update(cx, |state, cx| state.drag_move(fraction, cx));
+        });
+
+        let state = self.state.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+            if !phase.bubble() {
+                return;
+            }
+            if event.button != MouseButton::Left {
+                return;
+            }
+            state.update(cx, |state, _| state.end_drag());
+        });
+    }
+
     #[soul(id = "interaction.sdf.render-frame", step = "paint loop")]
     fn render_and_present(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
         let scale = window.scale_factor();
         let mut outcome = Presentation::Idle;
+        let mut animated_frame = false;
+        let mut outstanding = 0usize;
 
         self.state.update(cx, |state, _cx| {
             if state.renderer.is_none() && state.renderer_error.is_none() {
@@ -164,7 +240,7 @@ impl Canvas {
                 .as_ref()
                 .and_then(|scene| scene.data())
                 .map_or(0.0, |data| {
-                    (state.field_level * (data.level_count().max(1) - 1) as f32).round()
+                    effective_field_level(state.field_level, state.view_zoom, data.level_count())
                 });
 
             match renderer.render(
@@ -174,13 +250,18 @@ impl Canvas {
                     height,
                     time,
                     mouse: state.mouse_uv,
+                    view_center: state.view_center,
+                    view_zoom: state.view_zoom,
                     params: [level, state.contour_band],
                 },
             ) {
                 Ok(maybe_image) => {
                     state.compile_error = None;
                     state.size = (width, height);
+                    state.submitted_field_level = Some(level);
+                    outstanding = renderer.pending_frames();
                     if let Some(image) = maybe_image {
+                        animated_frame = state.animated;
                         let now = Instant::now();
                         if let Some(last) = state.last_present {
                             let seconds = now.duration_since(last).as_secs_f32();
@@ -196,11 +277,7 @@ impl Canvas {
                         state.last_present = Some(now);
 
                         let previous = state.frame.replace(image.clone());
-                        outcome = Presentation::Painted {
-                            image,
-                            previous,
-                            animated: state.animated,
-                        };
+                        outcome = Presentation::Painted { image, previous };
                     } else {
                         // The GPU is still catching up; ask for another frame
                         // so the result is presented as soon as it lands.
@@ -232,11 +309,12 @@ impl Canvas {
             }
         }
 
-        let keep_animating = match outcome {
-            Presentation::Painted { animated, .. } => animated,
-            Presentation::Pending => true,
-            Presentation::Idle => false,
-        };
+        // Keep the loop alive while any submitted frame is still outstanding:
+        // on a non-animated scene the presented frame may be one pipelined
+        // behind the newest submission (the ring drains without resubmitting),
+        // and stopping earlier would leave the newest view unpainted until
+        // the next input event.
+        let keep_animating = animated_frame || outstanding > 0;
         if keep_animating {
             window.request_animation_frame();
         }
@@ -246,4 +324,33 @@ impl Canvas {
 fn physical_edge(css_pixels: f32, scale: f32) -> u32 {
     let edge = (css_pixels * scale).round().max(1.0);
     edge.min(MAX_TEXTURE_EDGE as f32) as u32
+}
+
+/// The cursor position as a viewport fraction (the base field-uv mapping of
+/// the cursor: fraction from the left, fraction from the top).
+fn viewport_fraction(
+    position: Point<Pixels>,
+    origin: Point<Pixels>,
+    size: Size<Pixels>,
+) -> [f32; 2] {
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+    [
+        f32::from(position.x - origin.x) / width,
+        f32::from(position.y - origin.y) / height,
+    ]
+}
+
+/// The same inside test `track_mouse` applies: both fractions within 0..=1.
+fn inside_viewport(fraction: [f32; 2]) -> bool {
+    (0.0..=1.0).contains(&fraction[0]) && (0.0..=1.0).contains(&fraction[1])
+}
+
+/// The mip level the renderer submits: the LOD slider's base bias across the
+/// chain, refined downward by the map view's zoom — zooming in without mip
+/// refinement would just magnify blocks. `raw = base * (levels - 1) -
+/// log2(zoom)`, clamped to the chain.
+pub(crate) fn effective_field_level(base: f32, zoom: f32, levels: u32) -> f32 {
+    let max = (levels.max(1) - 1) as f32;
+    (base * max - zoom.log2()).round().clamp(0.0, max)
 }

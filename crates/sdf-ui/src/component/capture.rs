@@ -4,6 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 
 static STATUS_LINE: Mutex<String> = Mutex::new(String::new());
 static SETUP_PANEL_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CONTROL_BAR_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 // ---------------------------------------------------------------------------------------------- //
 
@@ -24,6 +25,14 @@ pub(crate) fn set_setup_panel(lines: Vec<String>) {
 
 pub(crate) fn setup_panel_lines() -> Vec<String> {
     lock(&SETUP_PANEL_LINES).clone()
+}
+
+pub(crate) fn set_control_bar(lines: Vec<String>) {
+    *lock(&CONTROL_BAR_LINES) = lines;
+}
+
+pub(crate) fn control_bar_lines() -> Vec<String> {
+    lock(&CONTROL_BAR_LINES).clone()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

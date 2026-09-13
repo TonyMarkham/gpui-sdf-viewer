@@ -63,5 +63,7 @@ pub(crate) const CONTROL_BAR_GAP: Pixels = px(12.0);
 
 pub(crate) const CONTROL_LEVEL_LABEL: &str = "LOD";
 pub(crate) const CONTROL_CONTOUR_LABEL: &str = "Contours";
+pub(crate) const CONTROL_VIEW_RESET_LABEL: &str = "1:1";
+pub(crate) const CONTROL_VIEW_RESET_BUTTON_ID: &str = "view-reset";
 pub(crate) const CONTOUR_BAND_DEFAULT: f32 = 8.0;
 pub(crate) const CONTOUR_BAND_MAX: f32 = 32.0;

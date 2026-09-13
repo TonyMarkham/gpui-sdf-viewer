@@ -132,18 +132,41 @@ fn first_frame(
     scene: &SdfScene,
     params: [f32; 2],
 ) -> std::result::Result<Option<std::sync::Arc<gpui::RenderImage>>, Error> {
-    const SIZE: u32 = 64;
+    first_frame_view(renderer, scene, params, [0.5, 0.5], 1.0)
+}
+
+/// Like [`first_frame`] with an explicit map view (field-uv space).
+fn first_frame_view(
+    renderer: &mut Renderer,
+    scene: &SdfScene,
+    params: [f32; 2],
+    view_center: [f32; 2],
+    view_zoom: f32,
+) -> std::result::Result<Option<std::sync::Arc<gpui::RenderImage>>, Error> {
+    render_until_frame(
+        renderer,
+        scene,
+        FrameRequest {
+            width: 64,
+            height: 64,
+            time: 0.0,
+            mouse: [0.0, 0.0],
+            view_center,
+            view_zoom,
+            params,
+        },
+    )
+}
+
+/// Renders the same request repeatedly until a frame completes, as the
+/// canvas's paint loop does; `None` when no frame became ready in time.
+fn render_until_frame(
+    renderer: &mut Renderer,
+    scene: &SdfScene,
+    request: FrameRequest,
+) -> std::result::Result<Option<std::sync::Arc<gpui::RenderImage>>, Error> {
     for _ in 0..300 {
-        match renderer.render(
-            scene,
-            &FrameRequest {
-                width: SIZE,
-                height: SIZE,
-                time: 0.0,
-                mouse: [0.0, 0.0],
-                params,
-            },
-        ) {
+        match renderer.render(scene, &request) {
             Ok(Some(image)) => return Ok(Some(image)),
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Err(error) => return Err(error),
@@ -292,6 +315,8 @@ fn renderer_produces_cpu_frames_from_scene_evaluation() {
                 height: SIZE,
                 time: 0.0,
                 mouse: [0.0, 0.0],
+                view_center: [0.5, 0.5],
+                view_zoom: 1.0,
                 params: [0.0, 0.0],
             },
         ) {
@@ -358,6 +383,8 @@ fn resizing_over_parked_staging_frames_raises_no_validation_error() {
         height: PARKED_SIZE,
         time: 0.0,
         mouse: [0.0, 0.0],
+        view_center: [0.5, 0.5],
+        view_zoom: 1.0,
         params: [0.0, 0.0],
     };
     let resized_frame = FrameRequest {
@@ -365,6 +392,8 @@ fn resizing_over_parked_staging_frames_raises_no_validation_error() {
         height: RESIZED_SIZE,
         time: 0.0,
         mouse: [0.0, 0.0],
+        view_center: [0.5, 0.5],
+        view_zoom: 1.0,
         params: [0.0, 0.0],
     };
 
@@ -477,6 +506,252 @@ fn data_scene_renders_the_uploaded_field() {
         bytes[((SIZE / 4 * SIZE + SIZE / 4) * 4 + 2) as usize],
         24,
         "tile (0, 0) at level 2 must carry its final mip byte"
+    );
+
+    // The map view through the real pipeline. The identity view above is the
+    // pre-change golden frame (the level/band assertions pin it). Aimed fully
+    // inside stub tile (1, 1) — the viewport covers uv [0.625, 0.875]² at
+    // zoom 4 — every sampled pixel must carry that tile's known constant:
+    // the transform is verified through the actual sampling path, not just
+    // "succeeds". A fresh renderer keeps the staging ring from handing back
+    // a stale identity frame.
+    let mut renderer = match Renderer::new() {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            eprintln!("skipping data-scene test: {error}");
+            return;
+        }
+    };
+    let frame_zoomed = match require_frame(
+        first_frame_view(&mut renderer, &scene, [0.0, 0.0], [0.75, 0.75], 4.0),
+        "the zoomed view failed to render",
+    ) {
+        Some(frame) => frame,
+        None => {
+            eprintln!("skipping data-scene test: no zoomed-view frame became ready in time");
+            return;
+        }
+    };
+    let bytes = require_bytes(&frame_zoomed, "the zoomed-view frame");
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(
+            chunk[2], 42,
+            "pixel {index} must sample stub tile (1, 1) at its constant under the zoomed view"
+        );
+        assert_eq!(
+            chunk[3], 255,
+            "pixel {index} must stay fully opaque under the zoomed view"
+        );
+    }
+}
+
+/// The same uv window re-renders at any viewport size: one zoomed view aimed
+/// inside stub tile (1, 1) must fill every pixel with that tile's constant at
+/// 64² and at 32². The view is stored in field-uv space, so a window resize
+/// re-renders the same field region instead of shifting it.
+#[test]
+fn the_view_window_is_size_independent() {
+    let _lock = render_lock();
+    let dir = match field_fixture("view-resize") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping view-resize test: {error}");
+            return;
+        }
+    };
+    let scene = match data_scene(&dir, "probe", "manifest.json") {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("skipping view-resize test: {error}");
+            return;
+        }
+    };
+    let mut renderer = match Renderer::new() {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            eprintln!("skipping view-resize test: {error}");
+            return;
+        }
+    };
+
+    for size in [64u32, 32u32] {
+        let frame = match require_frame(
+            render_until_frame(
+                &mut renderer,
+                &scene,
+                FrameRequest {
+                    width: size,
+                    height: size,
+                    time: 0.0,
+                    mouse: [0.0, 0.0],
+                    view_center: [0.75, 0.75],
+                    view_zoom: 4.0,
+                    params: [0.0, 0.0],
+                },
+            ),
+            "the resized-view frame failed to render",
+        ) {
+            Some(frame) => frame,
+            None => {
+                eprintln!("skipping view-resize test: no {size}² frame became ready in time");
+                return;
+            }
+        };
+        let bytes = require_bytes(&frame, "the resized-view frame");
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                chunk[2], 42,
+                "pixel {index} must sample stub tile (1, 1) at {size}² under the zoomed view"
+            );
+            assert_eq!(
+                chunk[3], 255,
+                "pixel {index} must stay fully opaque at {size}² under the zoomed view"
+            );
+        }
+    }
+}
+
+/// A view change must settle on the newest submitted frame: with a completed
+/// frame from the previous view possibly still parked in the ring, repainting
+/// without a state change must present the new view's frame and then stop
+/// supplying frames — never resubmit forever, and never end on the previous
+/// view's content.
+#[test]
+fn a_view_change_settles_on_the_newest_submitted_frame() {
+    let _lock = render_lock();
+    let dir = match field_fixture("view-settle") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("skipping view-settle test: {error}");
+            return;
+        }
+    };
+    let scene = match data_scene(&dir, "probe", "manifest.json") {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("skipping view-settle test: {error}");
+            return;
+        }
+    };
+    let mut renderer = match Renderer::new() {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            eprintln!("skipping view-settle test: {error}");
+            return;
+        }
+    };
+
+    match require_frame(
+        first_frame_view(&mut renderer, &scene, [0.0, 0.0], [0.5, 0.5], 1.0),
+        "the identity view failed to render",
+    ) {
+        Some(_) => {}
+        None => {
+            eprintln!("skipping view-settle test: no identity frame became ready in time");
+            return;
+        }
+    }
+
+    // A second, distinct submission under the same view, deliberately left
+    // undrained: its completed frame may still sit in the ring when the view
+    // changes — the stale-presentation setup the paint loop must survive.
+    // The mouse differs so the renderer treats it as a new frame.
+    let duplicate = FrameRequest {
+        width: 64,
+        height: 64,
+        time: 0.0,
+        mouse: [0.5, 0.0],
+        view_center: [0.5, 0.5],
+        view_zoom: 1.0,
+        params: [0.0, 0.0],
+    };
+    match renderer.render(&scene, &duplicate) {
+        Ok(_) => {}
+        Err(error) => unreachable!("the duplicate identity submission failed: {error}"),
+    }
+
+    // Repaint under the new view until the ring drains. Every frame presented
+    // after the new view's frame must carry the new view, and the sequence
+    // must end in `None` — an unchanged repaint submits nothing, so frames
+    // must run dry instead of being resupplied forever.
+    let zoomed = FrameRequest {
+        width: 64,
+        height: 64,
+        time: 0.0,
+        mouse: [0.0, 0.0],
+        view_center: [0.75, 0.75],
+        view_zoom: 4.0,
+        params: [0.0, 0.0],
+    };
+    let is_new_view = |image: &std::sync::Arc<gpui::RenderImage>| {
+        let bytes = require_bytes(image, "the zoomed repaint");
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|chunk| chunk[2] == 42 && chunk[3] == 255)
+    };
+    let mut saw_new_view = false;
+    let mut settled = false;
+    for _ in 0..300 {
+        match renderer.render(&scene, &zoomed) {
+            Ok(Some(frame)) => {
+                if is_new_view(&frame) {
+                    saw_new_view = true;
+                } else {
+                    assert!(
+                        !saw_new_view,
+                        "a frame presented after the new view's frame must carry the new view"
+                    );
+                }
+            }
+            Ok(None) if saw_new_view => {
+                settled = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(error) => unreachable!("the zoomed repaint failed: {error}"),
+        }
+    }
+    assert!(
+        saw_new_view,
+        "the new view's frame must be presented after the view change"
+    );
+    assert!(
+        settled,
+        "repainting the new view without state changes must drain to None, not resubmit forever"
+    );
+
+    // The paint loop stops only when every submitted frame is consumed: drain
+    // any straggler still in flight (the undrained duplicate) the same way the
+    // canvas does — by repainting without a state change — then assert the
+    // terminal state.
+    for _ in 0..300 {
+        if renderer.pending_frames() == 0 {
+            break;
+        }
+        match renderer.render(&scene, &zoomed) {
+            Ok(Some(frame)) => assert!(
+                is_new_view(&frame),
+                "a frame presented after the new view's frame must carry the new view"
+            ),
+            Ok(None) => {}
+            Err(error) => unreachable!("the drain repaint failed: {error}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        renderer.pending_frames(),
+        0,
+        "the ring must drain completely after the view change"
+    );
+    let settled_frame = match renderer.render(&scene, &zoomed) {
+        Ok(frame) => frame,
+        Err(error) => unreachable!("the settled repaint failed: {error}"),
+    };
+    assert!(
+        settled_frame.is_none(),
+        "a settled, unchanged repaint must not supply another frame"
     );
 }
 
@@ -1589,5 +1864,256 @@ fn scenes_sharing_a_body_but_not_data_still_switch(cx: &mut TestAppContext) {
             Some(2),
             "a body-identical scene with different data must replace the active scene"
         );
+        let view_center = canvas.read(cx).view_center();
+        assert_eq!(
+            view_center,
+            [0.5, 0.5],
+            "a scene switch must reset the view to the identity"
+        );
+        assert_eq!(
+            canvas.read(cx).view_zoom(),
+            1.0,
+            "a scene switch must reset the zoom to the fitted floor"
+        );
+    });
+}
+
+/// The uniform block's view slots: `view_center` occupies the former pad
+/// (24..32), the zoom factor rides `params.z` (40..44), `params.w` stays
+/// zeroed, and the block keeps its 48-byte size.
+#[test]
+fn uniform_bytes_pack_the_view_slots() {
+    let request = FrameRequest {
+        width: 640,
+        height: 480,
+        time: 1.5,
+        mouse: [0.25, 0.75],
+        view_center: [0.125, 0.875],
+        view_zoom: 4.0,
+        params: [2.0, 8.0],
+    };
+    let bytes = crate::renderer::uniform_bytes(&request);
+    assert_eq!(bytes.len(), 48, "the uniform block must stay 48 bytes");
+
+    let word = |offset: usize| {
+        let mut chunk = [0u8; 4];
+        chunk.copy_from_slice(&bytes[offset..offset + 4]);
+        f32::from_le_bytes(chunk)
+    };
+    assert_eq!(word(24), 0.125, "view_center.x lands at bytes 24..28");
+    assert_eq!(word(28), 0.875, "view_center.y lands at bytes 28..32");
+    assert_eq!(word(32), 2.0, "params.x still carries the level");
+    assert_eq!(word(36), 8.0, "params.y still carries the band width");
+    assert_eq!(word(40), 4.0, "params.z carries the zoom factor");
+    assert!(
+        bytes[44..48].iter().all(|byte| *byte == 0),
+        "params.w must stay zeroed"
+    );
+}
+
+/// The view math is pure: anchored zoom keeps the world uv under the anchor
+/// fixed, the drag moves content with the cursor, and the viewport clamp
+/// keeps the field covering the viewport — forcing exact identity at the
+/// zoom floor.
+#[test]
+fn view_math_anchors_zoom_and_follows_the_cursor() {
+    use crate::canvas::state::{clamped_view_center, panned_view_center, zoomed_view_center};
+
+    // Anchored zoom: the world uv under the anchor must not move.
+    let center = [0.5, 0.5];
+    let anchor = [0.25, 0.75];
+    let z0 = 1.0;
+    let z1 = 4.0;
+    let world_before = [
+        (anchor[0] - 0.5) / z0 + center[0],
+        (anchor[1] - 0.5) / z0 + center[1],
+    ];
+    let next = zoomed_view_center(center, anchor, z0, z1);
+    let world_after = [
+        (anchor[0] - 0.5) / z1 + next[0],
+        (anchor[1] - 0.5) / z1 + next[1],
+    ];
+    assert!(
+        (world_after[0] - world_before[0]).abs() < 1e-5
+            && (world_after[1] - world_before[1]).abs() < 1e-5,
+        "anchored zoom must keep the world uv under the anchor fixed, got {next:?}"
+    );
+
+    // Drag sign: dragging right-down moves the view center toward smaller uv
+    // on both axes — content follows the cursor (uv y runs top-down like
+    // screen y, so no y flip against the screen delta).
+    let panned = panned_view_center([0.5, 0.5], [0.1, 0.1], 4.0);
+    assert!(
+        (panned[0] - 0.475).abs() < 1e-6 && (panned[1] - 0.475).abs() < 1e-6,
+        "a right-down drag must pull the center toward smaller uv, got {panned:?}"
+    );
+
+    // Viewport clamp: the field covers the viewport at every zoom.
+    let clamped = clamped_view_center([0.1, 0.9], 4.0);
+    assert_eq!(
+        clamped,
+        [0.125, 0.875],
+        "the center clamps to [0.5/z, 1 - 0.5/z]"
+    );
+    assert_eq!(
+        clamped_view_center([0.2, 0.8], 1.0),
+        [0.5, 0.5],
+        "at the zoom floor the clamp forces exact identity"
+    );
+}
+
+/// The wheel factor is multiplicative on raw pixel deltas: a notched wheel
+/// step (≈ 3 lines at a ~20px line height) lands near ×1.25, trackpads zoom
+/// continuously, and absurd deltas clamp to [0.5, 2.0] per event.
+#[test]
+fn the_wheel_factor_is_multiplicative_and_clamped() {
+    use crate::canvas::state::wheel_zoom_factor;
+
+    let factor = wheel_zoom_factor(60.0);
+    assert!(
+        (factor - 1.25).abs() < 0.01,
+        "one notched wheel step must land near ×1.25, got {factor}"
+    );
+    assert!(
+        (wheel_zoom_factor(-60.0) - 1.0 / 1.25).abs() < 0.01,
+        "the opposite delta must zoom out symmetrically"
+    );
+    let proportional = wheel_zoom_factor(0.4);
+    let expected = (0.4_f32 * 0.0054).exp2();
+    assert!(
+        (proportional - expected).abs() < 1e-6,
+        "small trackpad deltas zoom proportionally, got {proportional}"
+    );
+    assert_eq!(wheel_zoom_factor(400.0), 2.0, "huge deltas clamp per event");
+    assert_eq!(
+        wheel_zoom_factor(-400.0),
+        0.5,
+        "huge deltas clamp per event"
+    );
+}
+
+/// Zoom refines the LOD slider's base bias downward toward mip 0: the level
+/// derivation subtracts log2(zoom) and clamps to the chain.
+#[test]
+fn zoom_refines_the_field_level_toward_mip_zero() {
+    use crate::canvas::effective_field_level;
+
+    assert_eq!(
+        effective_field_level(0.0, 1.0, 3),
+        0.0,
+        "the identity view keeps the slider's level"
+    );
+    assert_eq!(
+        effective_field_level(1.0, 1.0, 3),
+        2.0,
+        "the slider alone still reaches the coarsest level"
+    );
+    assert_eq!(
+        effective_field_level(1.0, 4.0, 3),
+        0.0,
+        "zoom refines the coarsest bias down to mip 0"
+    );
+    assert_eq!(
+        effective_field_level(0.5, 2.0, 3),
+        0.0,
+        "mid-slider with ×2 zoom refines one step"
+    );
+    assert_eq!(
+        effective_field_level(0.0, 64.0, 3),
+        0.0,
+        "zoom never refines below mip 0"
+    );
+    assert_eq!(
+        effective_field_level(1.0, 1.0, 1),
+        0.0,
+        "a single-level chain stays at 0"
+    );
+}
+
+/// The compiled module carries the view: the transformed `field_uv` and the
+/// reserved `view_p` helper — in the scene prelude and in the contour
+/// overlay's module, which compiles from the same helpers.
+#[test]
+fn the_prelude_carries_the_view_transform() {
+    let scene = match SdfScene::from_str(CIRCLE_SCENE, "circle") {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("unexpected scene parse failure: {error}");
+            return;
+        }
+    };
+    let module = scene.module_source();
+    assert!(
+        module.contains("fn view_p("),
+        "the prelude must reserve `view_p`, got: {module}"
+    );
+    assert!(
+        module.contains("u.view_center") && module.contains("u.params.z"),
+        "field_uv must apply the view from the uniform block"
+    );
+
+    let overlay = crate::overlay::module_source(2, 3);
+    assert!(
+        overlay.contains("fn view_p(") && overlay.contains("u.view_center"),
+        "the overlay compiles from the same field helpers"
+    );
+}
+
+/// The view mutators through the entity: zoom clamps to [1, 64], pan is a
+/// no-op at the floor (the clamp forces identity), drag bookkeeping only
+/// pans while a drag is running.
+#[gpui::test]
+fn view_mutators_clamp_and_follow_the_cursor(cx: &mut TestAppContext) {
+    use crate::SdfCanvasState;
+
+    cx.update(|cx| {
+        let canvas = cx.new(SdfCanvasState::new);
+        canvas.update(cx, |canvas, cx| {
+            canvas.zoom_at([0.25, 0.75], 1_000.0, cx);
+            assert_eq!(canvas.view_zoom(), 64.0, "zoom must clamp to the ceiling");
+        });
+        canvas.update(cx, |canvas, cx| {
+            canvas.zoom_at([0.8, 0.2], 0.1, cx);
+            assert_eq!(canvas.view_zoom(), 1.0, "zoom must clamp back to the floor");
+            assert_eq!(
+                canvas.view_center(),
+                [0.5, 0.5],
+                "the clamp forces exact identity at the floor"
+            );
+        });
+        canvas.update(cx, |canvas, cx| {
+            canvas.pan_by([0.3, -0.4], cx);
+            assert_eq!(
+                canvas.view_center(),
+                [0.5, 0.5],
+                "panning at the floor is a no-op: the field always covers the viewport"
+            );
+        });
+        canvas.update(cx, |canvas, cx| {
+            canvas.zoom_at([0.5, 0.5], 8.0, cx);
+            canvas.begin_drag([0.5, 0.5]);
+            canvas.drag_move([0.6, 0.5], cx);
+            let center = canvas.view_center();
+            assert!(
+                (center[0] - (0.5 - 0.1 / 8.0)).abs() < 1e-5,
+                "dragging right must pull the view center left, got {center:?}"
+            );
+            assert!(
+                (center[1] - 0.5).abs() <= f32::EPSILON,
+                "an x-only drag must not move the y center"
+            );
+            canvas.end_drag();
+            canvas.drag_move([0.9, 0.9], cx);
+            assert_eq!(
+                canvas.view_center(),
+                center,
+                "moves after the mouse-up must not pan"
+            );
+        });
+        canvas.update(cx, |canvas, cx| {
+            canvas.reset_view(cx);
+            assert_eq!(canvas.view_zoom(), 1.0, "reset returns to the fitted view");
+            assert_eq!(canvas.view_center(), [0.5, 0.5]);
+        });
     });
 }

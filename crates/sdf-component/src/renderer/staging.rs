@@ -11,6 +11,9 @@ pub(crate) struct Staging {
     pub(crate) bytes_per_row: u32,
     pub(crate) state: StagingState,
     pub(crate) mapped: Option<mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>>,
+    /// Submission order stamp. Ring-slot index is not submission order —
+    /// slots are reused as they free — so presentation ordering reads this.
+    pub(crate) sequence: u64,
 }
 
 impl Staging {

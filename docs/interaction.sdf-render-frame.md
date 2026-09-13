@@ -24,11 +24,12 @@ frame is an async staging-buffer copy plus a channel swizzle.
 
 - `Canvas` (gpui element) — drives the per-frame loop from `paint`
 - `State` (entity) — owns the renderer, scene, last frame, status,
-  and the field controls (`u.params`)
+  the field controls (`u.params`), and the map view (pan/zoom in field-uv
+  space, applied by the prelude's `field_uv`)
 - `Renderer` (wgpu) — device context, render pipeline, contour overlay
   pass, field texture, staging ring, readback
 - The host shell (sdf-ui) — selects scenes, drives the overlay toggle and
-  mip-level selector, displays status/failures
+  mip-level selector, resets the view, displays status/failures
 
 Scenes rendered through this flow follow [[concept.sdf-scene-contract]].
 
@@ -37,13 +38,24 @@ Scenes rendered through this flow follow [[concept.sdf-scene-contract]].
 - On every animation frame while the active scene is `animated = true`
 - On window resizes (the texture is recreated at the new device-pixel size)
 - On mouse movement over the canvas (the `u.mouse` uniform)
-- When the host selects a different scene
+- On wheel scroll or left-drag over a data scene's canvas (the map view
+  uniforms: `view_center`, `params.z`) — non-data scenes leave the wheel
+  alone
+- When the host selects a different scene (the view resets to the fitted
+  identity)
 - When the host changes a field parameter — the mip-level selector
-  (`u.params.x`) or the contour overlay band width (`u.params.y`)
+  (`u.params.x`), the contour overlay band width (`u.params.y`), or the
+  view reset control
 
 ## Flow
 
-1. `SdfCanvas::paint` → `SdfCanvasState.update` → `Renderer::render(scene, FrameRequest)`
+1. `SdfCanvas::paint` → `SdfCanvasState.update` → `Renderer::render(scene, FrameRequest)`.
+   Alongside the paint loop, the element registers the map view's input
+   handlers: the wheel zooms about the cursor (multiplicative `exp2` on the
+   raw pixel delta, per-event factor clamped to [0.5, 2.0]), a left-drag
+   pans with the cursor, and the mouse-up ends the drag wherever it released.
+   The view state lives on `State` in field-uv space and clamps so the field
+   always covers the viewport.
 2. The renderer aligns the field texture with the scene's data: a data
    scene's tiles are read, sha256-verified, length-checked, and uploaded
    into a texture array (one layer per grid tile, one mip level per declared
@@ -55,10 +67,12 @@ Scenes rendered through this flow follow [[concept.sdf-scene-contract]].
    takes effect when the scene's data identity changes (the host selects a
    scene bound to a different manifest/layer), not on the next paint.
 3. The renderer ensures the target texture matches the requested size, uploads
-   uniforms (resolution, time, aspect, mouse, params), and submits a render
-   pass — plus the contour overlay pass (alpha-blended over the scene's
+   uniforms (resolution, time, aspect, mouse, view, params), and submits a
+   render pass — plus the contour overlay pass (alpha-blended over the scene's
    output, only while a data texture is bound and `params.y` is on) — plus a
-   `copy_texture_to_buffer` into a free staging slot.
+   `copy_texture_to_buffer` into a free staging slot. The submitted mip level
+   is zoom-aware: the LOD slider's base bias refined downward by
+   `log2(zoom)`, clamped to the chain.
 4. `map_async` completions are drained by `device.poll(Maintain::Poll)`; a
    finished slot becomes a BGRA `RenderImage` frame.
 5. Back in `paint`, the new frame is drawn with `window.paint_image` and the

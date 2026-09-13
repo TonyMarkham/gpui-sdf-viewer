@@ -1,11 +1,11 @@
 pub mod config;
 pub mod constants;
-pub mod error;
-pub mod run;
 mod dds;
+pub mod error;
 mod export;
 mod field;
 mod paz;
+pub mod run;
 mod utilities;
 
 #[cfg(test)]
@@ -33,4 +33,3 @@ pub(crate) use crate::{
 
 #[cfg(test)]
 pub(crate) use crate::constants::{DDS_MAGIC, U32_SIZE};
-

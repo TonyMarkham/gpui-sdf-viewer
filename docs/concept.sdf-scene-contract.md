@@ -76,9 +76,32 @@ scene samples `field(p)` regardless of the geometry behind it. Scenes
 without `data` bind a 1×1 zero-filled stand-in — same bind group shape, the
 helpers stay inert.
 
-`u.params.x` is the mip-level selector (0.0 = mip 0) and `u.params.y` the
+### View
+
+Data scenes are map scenes: the canvas pans and zooms. The view lives
+entirely in the prelude — `field_uv` applies it — so every map scene and the
+contour overlay follow without scene-file changes:
+
+- The view is stored in field-uv space: `view_center` (the field-uv point at
+  the viewport center, default `[0.5, 0.5]`) and the zoom factor
+  `u.params.z` (default 1.0, clamped to [1.0, 64.0]). Because the state is
+  uv-fraction-based, window resizes re-render the same uv window instead of
+  shifting it.
+- The wheel zooms about the cursor and left-drag pans (content follows the
+  cursor); a `1:1` control in the shell resets to the fitted view, and every
+  scene switch opens fitted.
+- The viewport clamp keeps `view_center ∈ [0.5/z, 1 - 0.5/z]` per axis, so
+  the field always covers the viewport and the zoom floor is exactly the
+  identity.
+- The mip level the renderer submits is zoom-aware: the LOD slider stays the
+  base bias and zoom refines downward toward mip 0.
+- `view_p(p)` expresses the view back in the canvas `p` convention (the
+  space `u.mouse` uses), so a scene can deliberately map screen to world —
+  e.g. a cursor-anchored probe under zoom: `view_p(u.mouse)`.
+
+`u.params.x` is the mip-level selector (0.0 = mip 0), `u.params.y` the
 contour-overlay band width (0.0 = pass skipped; otherwise band width in
-field bytes) — see `State`.
+field bytes), and `u.params.z` the view zoom (1.0 = fitted) — see `State`.
 
 The component-level contour overlay is a second fragment pass, not a
 scene: it samples the same data texture and alpha-blends contour lines over
@@ -108,13 +131,14 @@ component premultiplies before presentation.
 ## Reserved names
 
 The prelude reserves `u` (the uniform block: `resolution`, `time`, `aspect`,
-`mouse`, `params`) and the helpers `sd_*`, `op_*`, `rot`, plus the field
-machinery: `t_field` (the data texture array), `s_field`,
+`mouse`, `view_center`, `params`) and the helpers `sd_*`, `op_*`, `rot`, plus
+the field machinery: `t_field` (the data texture array), `s_field`,
 `s_field_nearest`, `field`, `field_lod`, `field_raw`, `field_coord`,
-`field_uv`, and the `FIELD_*` constants. Scenes must not redefine them.
+`field_uv`, `view_p`, and the `FIELD_*` constants. Scenes must not redefine
+them.
 
 - `field(p) -> f32` — the field value at `p`, sampled linearly at the
-  `u.params.x` mip level
+  effective `u.params.x` mip level
 - `field_lod(p, level)` / `field_raw(p, level)` — explicit level; linear
   vs. nearest filtering (the raw-byte view for the inspect scene)
 

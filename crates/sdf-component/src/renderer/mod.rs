@@ -32,13 +32,25 @@ use wgpu::{
 
 /// Size of the uniform block in bytes. Must match the WGSL `Uniforms` struct:
 /// `resolution: vec2f` (0..8), `time: f32` (8..12), `aspect: f32` (12..16),
-/// `mouse: vec2f` (16..24), pad (24..32), `params: vec4f` (32..48): `.x` is
-/// the mip-level selector, `.y` the contour-overlay band width.
+/// `mouse: vec2f` (16..24), `view_center: vec2f` (24..32) — the field-uv
+/// point at the viewport center, `params: vec4f` (32..48): `.x` is the
+/// mip-level selector, `.y` the contour-overlay band width, `.z` the zoom
+/// factor, `.w` reserved (stays 0).
 const UNIFORM_SIZE: u64 = 48;
 
 /// Number of staging buffers kept in flight; the ring lets the GPU run a
 /// little ahead of presentation.
 const STAGING_SLOTS: usize = 3;
+
+/// The frame the renderer last submitted: the request and the data identity
+/// it was submitted under. A render call whose inputs all match submits
+/// nothing — the outstanding frame already carries those pixels, and without
+/// the skip every keep-alive paint would enqueue another one, so the ring
+/// could never drain and the paint loop could never settle.
+struct Submitted {
+    data_key: Option<String>,
+    request: FrameRequest,
+}
 
 /// Polls allowed while the resize test hook parks the staging ring.
 #[cfg(test)]
@@ -75,6 +87,18 @@ pub(crate) struct Renderer {
     pipeline: Option<RenderPipeline>,
     target: Option<Target>,
     staging: Vec<Staging>,
+    /// Sequence number for the next submission; slots are stamped with it so
+    /// presentation order follows submission order, not ring index. Starts
+    /// at 1: sequence 0 is never assigned, so the first submission clears
+    /// the initial watermark instead of comparing equal to it and being
+    /// rejected as stale.
+    next_sequence: u64,
+    /// Sequence of the newest frame handed to a caller for presentation.
+    /// Completed frames at or below this watermark are stale — superseded by
+    /// what was already shown — and are freed without presentation.
+    presented_sequence: u64,
+    /// The last successful submission, for the skip-unchanged check.
+    last_submission: Option<Submitted>,
     adapter_summary: String,
 }
 
@@ -247,6 +271,9 @@ impl Renderer {
             pipeline: None,
             target: None,
             staging: Vec::new(),
+            next_sequence: 1,
+            presented_sequence: 0,
+            last_submission: None,
             adapter_summary,
         })
     }
@@ -257,8 +284,9 @@ impl Renderer {
     }
 
     /// Binds the scene's field (or the inert stub) and compiles its module
-    /// when the source changed.
-    fn prepare_scene(&mut self, scene: &SdfScene) -> SdfResult<()> {
+    /// when the source changed. Returns whether this call (re)compiled the
+    /// pipeline — the scene's rendering inputs changed since the last call.
+    fn prepare_scene(&mut self, scene: &SdfScene) -> SdfResult<bool> {
         self.ensure_field(scene)?;
         self.ensure_overlay(scene)?;
 
@@ -267,9 +295,10 @@ impl Renderer {
             let pipeline = self.compile_pipeline("sdf-scene", &module_source, "fs_main", None)?;
             self.pipeline = Some(pipeline);
             self.compiled_source = Some(module_source);
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Submits (or continues) the render for `request` and returns a finished
@@ -290,11 +319,22 @@ impl Renderer {
             ));
         }
 
-        self.prepare_scene(scene)?;
+        let recompiled = self.prepare_scene(scene)?;
         self.ensure_target(request.width, request.height)?;
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, &uniform_bytes(request));
-        self.submit_frame(request.width, request.height, request);
+        let unchanged = !recompiled
+            && self.last_submission.as_ref().is_some_and(|submitted| {
+                submitted.request == *request && submitted.data_key == scene.data_key()
+            });
+        if !unchanged {
+            self.queue
+                .write_buffer(&self.uniform_buffer, 0, &uniform_bytes(request));
+            if self.submit_frame(request.width, request.height, request) {
+                self.last_submission = Some(Submitted {
+                    data_key: scene.data_key(),
+                    request: *request,
+                });
+            }
+        }
         self.advance_slots()?;
 
         self.build_presentable_frame(request.width, request.height)
@@ -772,24 +812,29 @@ impl Renderer {
             bytes_per_row,
             state: StagingState::Free,
             mapped: None,
+            sequence: 0,
         })
     }
 
     /// Submits the scene render — plus the contour overlay pass when a data
     /// texture is bound and the band width is on — and copies the result into
     /// one free staging slot of the current size. The overlay runs after the
-    /// scene pass and before the copy, so captured frames carry it.
+    /// scene pass and before the copy, so captured frames carry it. Returns
+    /// whether a submission actually happened; a ring with no free slot drops
+    /// the frame and the caller must not record it as submitted.
     #[soul(id = "interaction.sdf.render-frame", step = "render pass + copy")]
-    fn submit_frame(&mut self, width: u32, height: u32, request: &FrameRequest) {
+    fn submit_frame(&mut self, width: u32, height: u32, request: &FrameRequest) -> bool {
         let Some(target) = self.target.as_ref() else {
-            return;
+            return false;
         };
         let Some(pipeline) = self.pipeline.as_ref() else {
-            return;
+            return false;
         };
         let Some(slot_index) = self.free_slot_index(width, height) else {
-            return;
+            return false;
         };
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         let overlay_pipeline = self
             .overlay_pipeline
             .as_ref()
@@ -850,6 +895,7 @@ impl Renderer {
         }
 
         let slot = &mut self.staging[slot_index];
+        slot.sequence = sequence;
         encoder.copy_texture_to_buffer(
             target.texture.as_image_copy(),
             TexelCopyBufferInfo {
@@ -874,6 +920,7 @@ impl Renderer {
         });
         slot.state = StagingState::InFlight;
         slot.mapped = Some(receiver);
+        true
     }
 
     /// Polls the device and promotes completed mappings to `Mapped` (dropping
@@ -932,19 +979,51 @@ impl Renderer {
         Ok(())
     }
 
-    /// Converts the oldest finished staging buffer of the current size into a
+    /// Converts the newest finished staging buffer of the current size into a
     /// `RenderImage` with BGRA-ordered bytes, as gpui's atlas expects.
+    ///
+    /// Presentation is forward-only: the newest completed frame is presented
+    /// and every other completed frame of this size is freed as superseded —
+    /// an older completion presented after a newer one would step the canvas
+    /// backwards. Completed frames at or below the presented watermark are
+    /// stale and freed without presentation.
     #[soul(id = "interaction.sdf.render-frame", step = "staging to BGRA")]
     fn build_presentable_frame(
         &mut self,
         width: u32,
         height: u32,
     ) -> SdfResult<Option<Arc<RenderImage>>> {
-        let Some(slot_index) = self.staging.iter().position(|slot| {
-            slot.width == width
-                && slot.height == height
-                && matches!(slot.state, StagingState::Mapped(_))
-        }) else {
+        let mut newest: Option<usize> = None;
+        for (index, slot) in self.staging.iter().enumerate() {
+            if slot.width != width
+                || slot.height != height
+                || slot.sequence <= self.presented_sequence
+                || !matches!(slot.state, StagingState::Mapped(_))
+            {
+                continue;
+            }
+            let newer = match newest {
+                None => true,
+                Some(current) => slot.sequence > self.staging[current].sequence,
+            };
+            if newer {
+                newest = Some(index);
+            }
+        }
+
+        for (index, slot) in self.staging.iter_mut().enumerate() {
+            if Some(index) == newest
+                || slot.width != width
+                || slot.height != height
+                || !matches!(slot.state, StagingState::Mapped(_))
+            {
+                continue;
+            }
+            slot.state = StagingState::Free;
+            slot.mapped = None;
+        }
+
+        let Some(slot_index) = newest else {
             return Ok(None);
         };
 
@@ -952,17 +1031,30 @@ impl Renderer {
         let StagingState::Mapped(data) = &slot.state else {
             return Ok(None);
         };
+        let sequence = slot.sequence;
         let bytes = bgra_bytes(data, width, height, slot.bytes_per_row)
             .ok_or_else(|| SdfError::readback("staging data did not fill the frame"))?;
         let frame_buffer = RgbaImage::from_raw(width, height, bytes)
             .ok_or_else(|| SdfError::readback("frame buffer allocation failed"))?;
 
         slot.state = StagingState::Free;
+        self.presented_sequence = sequence;
 
         Ok(Some(Arc::new(RenderImage::new(SmallVec::from_elem(
             Frame::new(frame_buffer),
             1,
         )))))
+    }
+
+    /// Frames submitted but not yet presented, across all sizes: in-flight
+    /// copies plus completed-but-unpresented slots. The paint loop keeps
+    /// going while this is non-zero, so the last frame presented for a
+    /// gesture is always the newest one submitted.
+    pub(crate) fn pending_frames(&self) -> usize {
+        self.staging
+            .iter()
+            .filter(|slot| matches!(slot.state, StagingState::InFlight | StagingState::Mapped(_)))
+            .count()
     }
 
     fn free_slot_index(&self, width: u32, height: u32) -> Option<usize> {
@@ -1008,7 +1100,7 @@ fn bgra_bytes(data: &[u8], width: u32, height: u32, bytes_per_row: u32) -> Optio
     Some(out)
 }
 
-fn uniform_bytes(request: &FrameRequest) -> [u8; 48] {
+pub(crate) fn uniform_bytes(request: &FrameRequest) -> [u8; 48] {
     let mut bytes = [0u8; 48];
     let values = [
         request.width as f32,
@@ -1021,8 +1113,11 @@ fn uniform_bytes(request: &FrameRequest) -> [u8; 48] {
     for (index, value) in values.iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
+    bytes[24..28].copy_from_slice(&request.view_center[0].to_le_bytes());
+    bytes[28..32].copy_from_slice(&request.view_center[1].to_le_bytes());
     bytes[32..36].copy_from_slice(&request.params[0].to_le_bytes());
     bytes[36..40].copy_from_slice(&request.params[1].to_le_bytes());
+    bytes[40..44].copy_from_slice(&request.view_zoom.to_le_bytes());
     bytes
 }
 
