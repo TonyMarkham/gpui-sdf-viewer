@@ -7,12 +7,14 @@ use crate::{
 
 // ---------------------------------------------------------------------------------------------- //
 
+use soul_attributes::soul;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------------------------- //
 
 const STEP: &str = "extract";
 
+#[soul(id = "concept.game-data-pipeline", step = "extract: paz → dds")]
 pub fn run(config: &Config, progress: &mut dyn FnMut(Progress)) -> OfflineResult<()> {
     config.check()?;
     let paths = config.paths()?;

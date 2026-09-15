@@ -2,6 +2,7 @@ use crate::{OfflineError, OfflineResult, PazEntry};
 
 // ---------------------------------------------------------------------------------------------- //
 
+use soul_attributes::soul;
 use std::{collections::HashMap, path::Path};
 
 // ---------------------------------------------------------------------------------------------- //
@@ -25,6 +26,7 @@ pub(crate) struct Pamt {
 }
 
 impl Pamt {
+    #[soul(id = "concept.game-data-pipeline", step = "pamt table parse")]
     pub(crate) fn parse(data: &[u8], paz_dir: &Path, paz_stem: u32) -> OfflineResult<Pamt> {
         let mut off = 0usize;
         off += MAGIC_SIZE;

@@ -2,6 +2,7 @@ mod scheme;
 
 use self::scheme::{Scheme, scheme};
 use sdf_component::SdfError;
+use soul_attributes::soul;
 
 // ---------------------------------------------------------------------------------------------- //
 
@@ -29,6 +30,7 @@ pub(crate) enum Resolution {
 /// `<config dir>/data`). Everything else passes through untouched; an
 /// unknown scheme is an error naming the value. Windows drive paths
 /// (`D:/…`) are not schemes.
+#[soul(id = "concept.game-data-pipeline", step = "config: scheme rewrite")]
 pub(crate) fn resolve_scene_source(source: &str, data_dir: &Path) -> Result<Resolution, SdfError> {
     let mut rewritten = false;
     let mut lines = Vec::new();

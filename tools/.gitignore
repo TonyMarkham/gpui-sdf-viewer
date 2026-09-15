@@ -1,0 +1,12 @@
+# derived game data and build artifacts — never commit
+*.exe
+*.pdb
+*.bin
+*.csv
+*.pgm
+*.dec
+*.css
+*.xml
+*.html
+*.thtml
+*.paloc

@@ -13,3 +13,7 @@
 
 # Semantic Graph
 .refactor-radar/
+
+# investigation scratch (see tools/README.md)
+dump-*.csv
+*.pdb

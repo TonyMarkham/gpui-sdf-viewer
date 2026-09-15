@@ -18,6 +18,7 @@ use crate::{
 
 // ---------------------------------------------------------------------------------------------- //
 
+use soul_attributes::soul;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------------------------- //
@@ -83,6 +84,7 @@ impl Export {
         })
     }
 
+    #[soul(id = "concept.game-data-pipeline", step = "export write")]
     pub(crate) fn write(
         &self,
         fields: &FieldMap,

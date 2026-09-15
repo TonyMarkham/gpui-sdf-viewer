@@ -12,12 +12,14 @@ mod stub_spec;
 
 // ---------------------------------------------------------------------------------------------- //
 
+use soul_attributes::soul;
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------------------------- //
 
 const STEP: &str = "field";
 
+#[soul(id = "concept.game-data-pipeline", step = "field: dds → r8 payloads")]
 pub fn run(config: &Config, progress: &mut dyn FnMut(Progress)) -> OfflineResult<()> {
     config.check()?;
     let routes = export_routes(config)?;
@@ -226,6 +228,7 @@ fn convert_field(
     Ok((mip_count, converted))
 }
 
+#[soul(id = "concept.game-data-pipeline", step = "export round trip")]
 fn round_trip(
     config: &Config,
     fields: &FieldMap,

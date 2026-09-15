@@ -13,6 +13,7 @@ use sdf_offline::{
 // ---------------------------------------------------------------------------------------------- //
 
 use gpui::{AsyncApp, Context, PathPromptOptions, WeakEntity};
+use soul_attributes::soul;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
@@ -192,6 +193,7 @@ impl OfflineState {
 
     /// Runs the pipeline on a dedicated thread; the app thread drains the
     /// progress channel on a timer tick. No cancel in this slice.
+    #[soul(id = "concept.game-data-pipeline", step = "GUI extraction thread")]
     pub(crate) fn start_extraction(&mut self, cx: &mut Context<Self>) {
         if self.extraction_running() {
             return;
@@ -231,6 +233,7 @@ impl OfflineState {
             .is_ok()
     }
 
+    #[soul(id = "concept.game-data-pipeline", step = "data presence check")]
     fn compute_data_present(&self) -> bool {
         self.config
             .paths()

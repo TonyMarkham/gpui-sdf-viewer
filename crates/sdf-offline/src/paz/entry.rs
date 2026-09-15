@@ -2,6 +2,7 @@ use crate::{Compression, Crypto, OfflineError, OfflineResult};
 
 // ---------------------------------------------------------------------------------------------- //
 
+use soul_attributes::soul;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -33,6 +34,7 @@ impl PazEntry {
         glob_match(pattern, &self.path) || glob_match(pattern, file_name(&self.path))
     }
 
+    #[soul(id = "concept.game-data-pipeline", step = "paz entry decode")]
     pub(crate) fn read(&self) -> OfflineResult<Vec<u8>> {
         let read_size = if self.compressed() {
             self.comp_size as usize
